@@ -25,10 +25,10 @@ import numpy as np
 from PIL import Image
 
 try:
-    from . import animate, build, config, llm, pixelart, preview
+    from . import animate, build, config, ghost, llm, pixelart, preview
     from .rcon import Rcon, RconError
 except ImportError:
-    from mcmcp import animate, build, config, llm, pixelart, preview
+    from mcmcp import animate, build, config, ghost, llm, pixelart, preview
     from mcmcp.rcon import Rcon, RconError
 
 logger = logging.getLogger("mcmcp")
@@ -49,13 +49,38 @@ PROVIDER_NAMES = {"claude": "Claude", "gemini": "Gemini"}
 
 LAST_DESIGNS: dict[str, tuple[np.ndarray, list[str], list[tuple[int, int, int, int, int, int, str]]]] = {}
 
+
+class Preview(NamedTuple):
+    """A player's ghost preview in the world."""
+
+    origin: tuple[int, int, int]
+    facing: str
+    dim: str
+    shape: tuple[int, int, int]  # the design grid's shape
+    count: int                   # entities summoned
+
+
+class Source(NamedTuple):
+    """What !designfix needs to change a player's last design."""
+
+    description: str
+    image_png: bytes | None
+    limits: tuple[int, int, int]
+    dir: Path  # the design's folder, with its response.txt and preview.png
+
+
+PREVIEWS: dict[str, Preview] = {}
+LAST_SOURCES: dict[str, Source] = {}
+
 HELP_LINES = (
     "Commands (ops only):",
-    "!design <description> - the AI designs it and builds it in front of you",
+    "!design <description> - the AI designs it and shows you a preview to place",
     "!design <image link> <description> - the same, using the picture as a reference",
-    "!place - builds your last design again where you stand (no AI)",
+    "!designfix <changes> - the AI changes your last design, e.g. !designfix make the roof taller",
+    "!move - moves the preview to where you stand, facing where you look",
+    "!place - builds the preview where it is (or your last design where you stand)",
     "!pixelart <image link> [width] - builds the picture as a flat wall (no AI)",
-    "!designstop - stops the build that is running",
+    "!designstop - stops the build that is running, or removes your preview",
     "!designai [claude|gemini] - shows or switches the AI",
     "!designanim [on|off] - shows or switches the builder crew animation",
     "!designreview [on|off] - shows or switches the AI's check of its own build",
@@ -145,6 +170,11 @@ def parse_best_command(message: str) -> tuple[bool, str | None]:
 def parse_place_command(message: str) -> bool:
     """Parses a message for the !place command (case-insensitive, exact, trimmed)."""
     return message.strip().lower() == "!place"
+
+
+def parse_move_command(message: str) -> bool:
+    """Parses a message for the !move command (case-insensitive, exact, trimmed)."""
+    return message.strip().lower() == "!move"
 
 
 class Heartbeat:
@@ -913,18 +943,21 @@ def choose_version(
     build_dir: Path,
     send_fn: Callable[[str], Any],
     provider_name: str,
-) -> tuple[np.ndarray, list[str], list[tuple[int, int, int, int, int, int, str]], bool, str]:
+) -> tuple[np.ndarray, list[str], list[tuple[int, int, int, int, int, int, str]], bool, str, Path]:
     """Asks the AI to pick the better of two versions (and fix it) instead of the review round.
     With only one version (or after !designstop) that one goes through the normal review round.
-    If the pick fails, A is used. Returns (grid, palette, dboxes, skipped, note about the pick)."""
+    If the pick fails, A is used. Returns (grid, palette, dboxes, skipped, note about the pick,
+    the final design's folder)."""
     if len(versions) == 1 or STOP.is_set():
         v = versions[0]
         grid, palette, dboxes, skipped = v.grid, v.palette, v.dboxes, v.skipped
+        final_dir = v.dir
         if get_review() and not STOP.is_set():
             rev = review_design(description, limits, image_png, provider, v.raw, v.dir, send_fn, provider_name)
             if rev is not None:
                 grid, palette, dboxes, skipped = rev[4:]
-        return grid, palette, dboxes, skipped, f"{v.label} (not compared)"
+                final_dir = v.dir / "review"
+        return grid, palette, dboxes, skipped, f"{v.label} (not compared)", final_dir
 
     send_fn("Comparing the two versions...")
     heartbeat = Heartbeat(send_fn, provider_name, config.HEARTBEAT_SECONDS)
@@ -942,10 +975,10 @@ def choose_version(
         v = versions[0]
         if STOP.is_set():
             logger.info("Pick stopped: %s", e)
-            return v.grid, v.palette, v.dboxes, v.skipped, "A (stopped)"
+            return v.grid, v.palette, v.dboxes, v.skipped, "A (stopped)", v.dir
         logger.warning("Pick failed: %s", e)
         send_fn("Picking failed; building version A.")
-        return v.grid, v.palette, v.dboxes, v.skipped, "A (the pick failed)"
+        return v.grid, v.palette, v.dboxes, v.skipped, "A (the pick failed)", v.dir
     finally:
         heartbeat.stop()
 
@@ -954,13 +987,13 @@ def choose_version(
         try:
             rev = build_revision(revised, limits, build_dir / "review")
             send_fn(f"Picked version {v.label} and improved it.")
-            return (*rev[4:], f"{v.label} (improved)")
+            return (*rev[4:], f"{v.label} (improved)", build_dir / "review")
         except Exception as e:
             logger.warning("Improved version failed: %s", e)
             send_fn(f"Picked version {v.label}; the improvement failed.")
-            return v.grid, v.palette, v.dboxes, v.skipped, f"{v.label} (the improvement failed)"
+            return v.grid, v.palette, v.dboxes, v.skipped, f"{v.label} (the improvement failed)", v.dir
     send_fn(f"Picked version {v.label}.")
-    return v.grid, v.palette, v.dboxes, v.skipped, v.label
+    return v.grid, v.palette, v.dboxes, v.skipped, v.label, v.dir
 
 
 def forceload_commands(
@@ -1098,53 +1131,222 @@ def _place_loaded(
         send_message(rcon, player, f"Done: {total_blocks} blocks in {mins}m {secs}s.")
 
 
+def player_spot(rcon: Rcon, player: str) -> tuple[tuple[int, int, int], str, str]:
+    """Where the player stands and looks: (origin, facing, dim)."""
+    pos_reply = rcon.command(f"data get entity {player} Pos")
+    rot_reply = rcon.command(f"data get entity {player} Rotation")
+    dim_reply = rcon.command(f"data get entity {player} Dimension")
+
+    pos = parse_pos_reply(pos_reply)
+    rot = parse_rotation_reply(rot_reply)
+    dim = parse_dimension_reply(dim_reply)
+
+    origin = (math.floor(pos[0]), math.floor(pos[1]), math.floor(pos[2]))
+    return origin, build.facing_from_yaw(rot[0]), dim
+
+
+def clear_preview(rcon: Rcon, player: str) -> None:
+    """Removes the player's ghost preview, if any. Entities in unloaded chunks can't be killed,
+    so if some are left the preview's chunks are force-loaded until they are gone (or
+    config.GHOST_CLEAR_SECONDS pass)."""
+    p = PREVIEWS.pop(player.strip().lower(), None)
+    if p is None:
+        return
+    kill = ghost.kill_command(player)
+    killed = ghost.killed_count(rcon.command(kill))
+    if killed >= p.count:
+        return
+    for cmd in forceload_commands(p.dim, "add", p.shape, p.origin, p.facing):
+        rcon.command(cmd)
+    try:
+        deadline = time.monotonic() + config.GHOST_CLEAR_SECONDS
+        while killed < p.count and time.monotonic() < deadline:
+            time.sleep(0.5)
+            killed += ghost.killed_count(rcon.command(kill))
+    finally:
+        for cmd in forceload_commands(p.dim, "remove", p.shape, p.origin, p.facing):
+            rcon.command(cmd)
+
+
+def show_preview(
+    rcon: Rcon,
+    player: str,
+    design: tuple[np.ndarray, list[str], list[tuple[int, int, int, int, int, int, str]]],
+    origin: tuple[int, int, int],
+    facing: str,
+    dim: str,
+) -> None:
+    """Replaces the player's ghost preview with a hologram of the design at origin and tells them."""
+    clear_preview(rcon, player)
+    grid, palette, dboxes = design
+    stamped, stamped_palette = build.stamp_details(grid, palette, dboxes)
+    k, boxes = ghost.ghost_boxes(stamped, config.GHOST_MAX_ENTITIES)
+    pacer = Pacer()
+    count = 0
+    for cmd in ghost.summon_commands(boxes, stamped_palette, grid.shape[0], origin, facing, dim, player):
+        if "Summoned" in rcon.command(cmd):
+            count += 1
+        pacer.wait(1)
+    PREVIEWS[player.strip().lower()] = Preview(origin, facing, dim, grid.shape, count)
+    X, Y, Z = grid.shape
+    send_message(
+        rcon,
+        player,
+        f"Preview: {X}x{Y}x{Z}"
+        + (f" in {k}-block cubes" if k > 1 else "")
+        + ("; part of it is too far away to show" if count < len(boxes) else "")
+        + ".",
+    )
+    send_message(
+        rcon,
+        player,
+        "Type !place to build it there, !move to move it to where you stand, "
+        "!designfix <changes> to change it, or !designstop to remove it.",
+    )
+
+
+def _misfit(grid: np.ndarray, origin: tuple[int, int, int], dim: str) -> str | None:
+    """Why the grid can't go at origin (too close to the world top or too big), or None if it fits."""
+    try:
+        w, d, t = world_limits(origin[1], dim)
+    except ValueError as e:
+        return str(e)
+    X, Y, Z = grid.shape
+    if X > w or Y > d or Z > t:
+        return f"The design ({X}x{Y}x{Z}) does not fit here (limits {w}x{d}x{t})."
+    return None
+
+
+def _reason(e: Exception) -> str:
+    """First line of an error message, at most 100 characters."""
+    err_str = str(e).strip()
+    reason = err_str.splitlines()[0] if err_str else type(e).__name__
+    return reason[:97] + "..." if len(reason) > 100 else reason
+
+
 def run_place(rcon: Rcon, player: str) -> None:
-    """Places the player's last voxelized design at their current position and facing."""
+    """Builds the player's last voxelized design: where their preview is, or else at their
+    current position and facing."""
     STOP.clear()
     start_time = time.time()
+    crew: animate.Crew | None = None
+    try:
+        key = player.strip().lower()
+        saved = LAST_DESIGNS.get(key)
+        if saved is None:
+            send_message(rcon, player, "No saved design. Use !design first.")
+            return
+
+        p = PREVIEWS.get(key)
+        if p is not None:
+            origin, facing, dim = p.origin, p.facing, p.dim
+        else:
+            origin, facing, dim = player_spot(rcon, player)
+
+        misfit = _misfit(saved[0], origin, dim)
+        if misfit:
+            send_message(rcon, player, misfit)
+            return
+
+        clear_preview(rcon, player)
+
+        if get_animate():
+            rcon.command(animate.kill_crew_command())
+            crew = animate.Crew(rcon, dim, player, origin, facing, config.CREW_SIZE)
+            crew.summon(saved[0].shape[0])
+        place_design(rcon, player, saved, origin, facing, dim, start_time, crew=crew)
+
+    except Exception as e:
+        logger.exception("Place failed for player %s: %s", player, e)
+        send_message(rcon, player, f"Build failed: {_reason(e)}")
+    finally:
+        if crew is not None:
+            crew.remove()
+
+
+def run_move(rcon: Rcon, player: str) -> None:
+    """Moves the player's preview (or shows one) to where they stand, facing where they look."""
     try:
         saved = LAST_DESIGNS.get(player.strip().lower())
         if saved is None:
             send_message(rcon, player, "No saved design. Use !design first.")
             return
-
-        pos_reply = rcon.command(f"data get entity {player} Pos")
-        rot_reply = rcon.command(f"data get entity {player} Rotation")
-        dim_reply = rcon.command(f"data get entity {player} Dimension")
-
-        pos = parse_pos_reply(pos_reply)
-        rot = parse_rotation_reply(rot_reply)
-        dim = parse_dimension_reply(dim_reply)
-
-        origin = (math.floor(pos[0]), math.floor(pos[1]), math.floor(pos[2]))
-        facing = build.facing_from_yaw(rot[0])
-
-        try:
-            limits = world_limits(origin[1], dim)
-        except ValueError as e:
-            send_message(rcon, player, str(e))
+        origin, facing, dim = player_spot(rcon, player)
+        misfit = _misfit(saved[0], origin, dim)
+        if misfit:
+            send_message(rcon, player, misfit)
             return
-
-        w, d, t = limits
-        grid, palette, dboxes = saved
-        X, Y, Z = grid.shape
-        if X > w or Y > d or Z > t:
-            send_message(
-                rcon,
-                player,
-                f"The design ({X}x{Y}x{Z}) does not fit here (limits {w}x{d}x{t}).",
-            )
-            return
-
-        place_design(rcon, player, saved, origin, facing, dim, start_time)
-
+        show_preview(rcon, player, saved, origin, facing, dim)
     except Exception as e:
-        logger.exception("Place failed for player %s: %s", player, e)
-        err_str = str(e).strip()
-        reason = err_str.splitlines()[0] if err_str else type(e).__name__
-        if len(reason) > 100:
-            reason = reason[:97] + "..."
-        send_message(rcon, player, f"Build failed: {reason}")
+        logger.exception("Move failed for player %s: %s", player, e)
+        send_message(rcon, player, f"Move failed: {_reason(e)}")
+
+
+def run_fix(rcon: Rcon, player: str, changes: str) -> None:
+    """Asks the AI to change the player's last design as they describe, then shows the new
+    version as a preview where the old preview was (or where they stand)."""
+    STOP.clear()
+    try:
+        key = player.strip().lower()
+        src = LAST_SOURCES.get(key)
+        if src is None:
+            send_message(rcon, player, "No design to change. Use !design first.")
+            return
+        send_fn = lambda msg: send_message(rcon, player, msg)
+        provider = get_provider()
+        provider_name = PROVIDER_NAMES.get(provider, provider.capitalize())
+        send_message(rcon, player, f"Changing the design with {provider_name}...")
+        raw = (src.dir / "response.txt").read_text(encoding="utf-8")
+        preview_png = (src.dir / "preview.png").read_bytes()
+        heartbeat = Heartbeat(send_fn, provider_name, config.HEARTBEAT_SECONDS)
+        narrator = Narrator(send_fn, on_first=heartbeat.stop)
+        heartbeat.start()
+        try:
+            rev = llm.review(
+                src.description,
+                src.limits,
+                raw,
+                preview_png,
+                image_png=src.image_png,
+                provider=provider,
+                on_text=narrator.feed,
+                stop=STOP,
+                feedback=changes,
+            )
+        finally:
+            heartbeat.stop()
+        narrator.flush()
+        if rev is None:
+            send_message(rcon, player, "The AI kept the design as it is.")
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        out_dir = config.WORK_DIR / f"{timestamp}-{player}-fix"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "request.txt").write_text(
+            f"Player: {player}\nProvider: {provider}\nFix of: {src.dir}\nChanges: {changes}\n",
+            encoding="utf-8",
+        )
+        send_message(rcon, player, "Rendering...")
+        *_, grid, palette, dboxes, skipped = build_revision(rev, src.limits, out_dir)
+        if skipped:
+            send_message(rcon, player, "Scaled the design down to fit; skipped the detail blocks.")
+        design_tuple = (grid, palette, dboxes)
+        LAST_DESIGNS[key] = design_tuple
+        LAST_SOURCES[key] = src._replace(dir=out_dir)
+
+        if STOP.is_set():
+            send_message(rcon, player, "Stopped. Type !place to build it.")
+            return
+        p = PREVIEWS.get(key)
+        origin, facing, dim = (p.origin, p.facing, p.dim) if p is not None else player_spot(rcon, player)
+        show_preview(rcon, player, design_tuple, origin, facing, dim)
+
+    except llm.LlmStopped:
+        send_message(rcon, player, "Stopped.")
+    except Exception as e:
+        logger.exception("Fix failed for player %s: %s", player, e)
+        send_message(rcon, player, f"Fix failed: {_reason(e)}")
 
 
 def run_build(
@@ -1156,25 +1358,19 @@ def run_build(
     blocks_override: Any = None,
     ai: str | None = None,
     best: bool | None = None,
+    preview: bool = False,
 ) -> None:
     """Executes the full in-game design and build pipeline.
-    best: two designs and the AI keeps the better one (default: the !designbest setting)."""
+    best: two designs and the AI keeps the better one (default: the !designbest setting).
+    preview: show a preview instead of building."""
     STOP.clear()
     start_time = time.time()
     crew: animate.Crew | None = None
     survey: animate.Survey | None = None
     try:
         # 1. Player info via RCON
-        pos_reply = rcon.command(f"data get entity {player} Pos")
-        rot_reply = rcon.command(f"data get entity {player} Rotation")
-        dim_reply = rcon.command(f"data get entity {player} Dimension")
-
-        pos = parse_pos_reply(pos_reply)
-        rot = parse_rotation_reply(rot_reply)
-        dim = parse_dimension_reply(dim_reply)
-
-        origin = (math.floor(pos[0]), math.floor(pos[1]), math.floor(pos[2]))
-        facing = build.facing_from_yaw(rot[0])
+        origin, facing, dim = player_spot(rcon, player)
+        clear_preview(rcon, player)  # a new design replaces the old preview
 
         # 2. World limits
         try:
@@ -1262,13 +1458,14 @@ def run_build(
         if best:
             send_message(rcon, player, "Rendering...")
             versions = build_versions(results, limits, build_dir, send_fn)
-            grid, palette, dboxes, skipped, note = choose_version(
+            grid, palette, dboxes, skipped, note, final_dir = choose_version(
                 description, limits, image_png, provider, versions, build_dir, send_fn, provider_name
             )
             with (build_dir / "request.txt").open("a", encoding="utf-8") as f:
                 f.write(f"Picked: {note}\n")
         else:
             save_design(build_dir, raw, scad, blocks, mix, details)
+            final_dir = build_dir
             send_message(rcon, player, "Rendering...")
             stls = build.render_parts(scad, list(blocks), build_dir)
             grid, palette, dboxes, skipped = voxelize_design(scad, stls, blocks, mix, details, limits, build_dir)
@@ -1286,6 +1483,7 @@ def run_build(
                 )
                 if rev is not None:
                     scad, blocks, mix, details, grid, palette, dboxes, skipped = rev
+                    final_dir = build_dir / "review"
 
         if skipped:
             send_message(rcon, player, "Scaled the design down to fit; skipped the detail blocks.")
@@ -1293,11 +1491,16 @@ def run_build(
         # 7. Keep it for !place, then check the room and place
         design_tuple = (grid, palette, dboxes)
         LAST_DESIGNS[player.strip().lower()] = design_tuple
+        if not overridden:
+            LAST_SOURCES[player.strip().lower()] = Source(description, image_png, limits, final_dir)
 
         if STOP.is_set():
             send_message(rcon, player, "Stopped. Type !place to build it.")
             return
 
+        if preview:
+            show_preview(rcon, player, design_tuple, origin, facing, dim)
+            return
         place_design(rcon, player, design_tuple, origin, facing, dim, start_time, crew=crew)
 
     except llm.LlmStopped:
@@ -1370,7 +1573,7 @@ def run_offline_build(
         versions = build_versions(results, limits, build_dir, print)
         t_render = time.time() - t0
         t0 = time.time()
-        grid, palette, dboxes, skipped, note = choose_version(
+        grid, palette, dboxes, skipped, note, _ = choose_version(
             description, limits, image_png, provider, versions, build_dir, print, provider_name
         )
         t_review = time.time() - t0
@@ -1761,6 +1964,16 @@ def handle_chat_line(
         if build_lock is not None and build_lock.locked():
             STOP.set()
             send_message(rcon, player, "Stopping...")
+        elif player.strip().lower() in PREVIEWS and (build_lock is None or build_lock.acquire(blocking=False)):
+            def clear_worker():
+                try:
+                    clear_preview(rcon, player)
+                    send_message(rcon, player, "Preview removed.")
+                finally:
+                    if build_lock is not None:
+                        build_lock.release()
+
+            threading.Thread(target=clear_worker, daemon=True).start()
         else:
             send_message(rcon, player, "Nothing is running.")
         return
@@ -1813,6 +2026,52 @@ def handle_chat_line(
 
         t = threading.Thread(target=px_worker, daemon=True)
         t.start()
+        return
+
+    is_fix_cmd, fix_arg = _parse_word_command(message, "!designfix")
+    if is_fix_cmd:
+        if not is_op(player, config.OPS_FILE):
+            send_message(rcon, player, "Only ops can use !designfix.")
+            return
+        if fix_arg is None:
+            send_message(rcon, player, "Usage: !designfix <changes>, e.g. !designfix make the roof taller")
+            return
+        if player.strip().lower() not in LAST_SOURCES:
+            send_message(rcon, player, "No design to change. Use !design first.")
+            return
+        if build_lock is not None and not build_lock.acquire(blocking=False):
+            send_message(rcon, player, "A build is already running. Try again when it finishes.")
+            return
+
+        def fix_worker():
+            try:
+                run_fix(rcon, player, fix_arg)
+            finally:
+                if build_lock is not None:
+                    build_lock.release()
+
+        threading.Thread(target=fix_worker, daemon=True).start()
+        return
+
+    if parse_move_command(message):
+        if not is_op(player, config.OPS_FILE):
+            send_message(rcon, player, "Only ops can use !move.")
+            return
+        if player.strip().lower() not in LAST_DESIGNS:
+            send_message(rcon, player, "No saved design. Use !design first.")
+            return
+        if build_lock is not None and not build_lock.acquire(blocking=False):
+            send_message(rcon, player, "A build is already running. Try again when it finishes.")
+            return
+
+        def move_worker():
+            try:
+                run_move(rcon, player)
+            finally:
+                if build_lock is not None:
+                    build_lock.release()
+
+        threading.Thread(target=move_worker, daemon=True).start()
         return
 
     if parse_place_command(message):
@@ -1872,7 +2131,7 @@ def handle_chat_line(
 
     def worker():
         try:
-            run_build(rcon, player, desc, image_url=img_url)
+            run_build(rcon, player, desc, image_url=img_url, preview=True)
         finally:
             if build_lock is not None:
                 build_lock.release()
@@ -1960,6 +2219,10 @@ def main() -> None:
         rcon.command(animate.kill_crew_command())  # builders left over from a crash
     except Exception as e:
         logger.warning("Couldn't remove leftover builders: %s", e)
+    try:
+        rcon.command(ghost.kill_command())  # previews left over from a crash
+    except Exception as e:
+        logger.warning("Couldn't remove leftover previews: %s", e)
 
     logger.info("Starting mcmcp service, tailing %s...", config.LOG_FILE)
     try:

@@ -43,6 +43,7 @@ BEST = False                       # !design: two designs at once, the AI keeps 
 SMOOTH = True                      # stairs and slabs on sloped surfaces (build.smooth)
 CREW_SIZE = 3                      # armor-stand builders
 GHOST_MAX_ENTITIES = 400           # !design preview: most block display entities in the hologram
+GHOST_CLEAR_SECONDS = 10           # !design preview: how long removing one may wait for its chunks to load
 # Never placed; swapped for FALLBACK_BLOCK. Fluids and fire, TNT, falling blocks (plus every
 # *_concrete_powder), portals, blocks survival players can't break, and spawners.
 BANNED_BLOCKS = frozenset("minecraft:" + b for b in (
