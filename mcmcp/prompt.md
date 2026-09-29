@@ -40,7 +40,8 @@ Think this through before writing code:
 - Directly above each module, write exactly one narration line in the form `// > <what this part is, as a short present-tense phrase, max 60 characters>`, e.g. `// > Raising the stone keep with four corner towers`. These lines are shown to the player in chat while you write, so make them vivid and specific. Do not use `// >` anywhere else.
 - At top level, instantiate each part:
   if (part == "all" || part == "<name>") <name>();
-- Geometry on integer coordinates where you can. Every feature must be at least 1 unit thick; anything thinner vanishes when turned into blocks.
+- Every feature must be at least 1 unit thick; anything thinner vanishes when turned into blocks. A 1-unit feature must also sit exactly between whole numbers (x from 0 to 1, not from -0.5 to 0.5), or it vanishes too.
+- Buildings: geometry on integer coordinates. Sculptures: curves, rotations and fractional coordinates are fine, but make sculpted features at least 2 units thick.
 - Buildings: walls, floors and roofs at least 1 unit thick; interiors hollow; openings (doors, windows, rooms) are empty space made with `difference()`.
 - Sculptures: solid shapes, no interior, no doors, windows or roof unless the description asks for them.
 - Parts may overlap. Later parts in the JSON "blocks" dictionary override earlier ones (e.g. list "glass", "trim", and "light" after "walls").
@@ -60,6 +61,7 @@ Think this through before writing code:
 - Palette: 3-5 main materials in clear roles (primary, secondary, accent, roof, glass).
 
 # SCULPTURE TECHNIQUES
+- Never build a sculpture only from boxes: bodies, limbs, heads, helmets, capes and creatures are spheres, scaled spheres, cylinders, cones and hulls. Boxes are only for pedestals, blades, straight plates and trims.
 - Get the proportions right first (a heroic human figure is about 8 heads tall), then the pose.
 - Model from overlapping primitives: spheres, scaled spheres (`scale([a, b, c]) sphere(r)`), cylinders and cones (`cylinder(h, r1, r2)`), boxes, and `hull()` of two or three small spheres for limbs and tapered shapes. Use `rotate()` for the pose.
 - Anything that must survive as blocks (fingers, a blade, a staff, horns) is at least 2 blocks thick at large scale; merge fingers into a hand.
@@ -90,7 +92,7 @@ Think this through before writing code:
 - Unless the subject floats (a floating island, a ship in the sky), every part connects to structure below it down to z = 0.
 - Light it where it fits, with `minecraft:glowstone`, `minecraft:sea_lantern`, `minecraft:shroomlight` or `minecraft:ochre_froglight` set into walls, ceilings or a base, or with lanterns and torches in "details".
 
-# WORKED EXAMPLE
+# WORKED EXAMPLE 1: A BUILDING
 
 ```json
 {
@@ -170,4 +172,96 @@ if (part == "all" || part == "frame") frame();
 if (part == "all" || part == "floors") floors();
 if (part == "all" || part == "roof") roof();
 if (part == "all" || part == "glass") glass();
+```
+
+# WORKED EXAMPLE 2: A SCULPTURE
+A small knight (33 tall) to keep the example short; a large statue is built the same way at the size asked for.
+
+```json
+{
+  "blocks": {
+    "pedestal": "minecraft:stone_bricks",
+    "body": "minecraft:stone",
+    "armor": "minecraft:polished_deepslate",
+    "cape": "minecraft:waxed_weathered_copper",
+    "blade": "minecraft:iron_block",
+    "hilt": "minecraft:gold_block"
+  },
+  "mix": {
+    "minecraft:stone_bricks": {"minecraft:stone_bricks": 6, "minecraft:cracked_stone_bricks": 2, "minecraft:mossy_stone_bricks": 2},
+    "minecraft:stone": {"minecraft:stone": 6, "minecraft:andesite": 2, "minecraft:mossy_cobblestone": 1}
+  },
+  "details": [
+    [-8, -1, 0, 7, -1, 0, "minecraft:stone_brick_stairs[facing=north]"],
+    [-7, 1, 4, "minecraft:lantern"], [6, 1, 4, "minecraft:lantern"]
+  ]
+}
+```
+
+```openscad
+part = "all";
+$fn = 32;
+
+// > Cutting a two-step stone brick pedestal
+module pedestal() {
+    translate([-8, 0, 0]) cube([16, 16, 2]);
+    translate([-7, 1, 2]) cube([14, 14, 2]);
+}
+
+// > Shaping the knight's legs, torso, arms and head
+module body() {
+    for (s = [-1, 1]) hull() {                          // legs: ankle to hip
+        translate([s * 2.5, 8, 5]) sphere(1.6);
+        translate([s * 2, 8, 15]) sphere(2);
+    }
+    hull() {                                            // torso: waist to broad chest
+        translate([0, 8, 16]) scale([1.6, 1, 1]) sphere(2.6);
+        translate([0, 8, 22]) scale([2, 1.1, 1]) sphere(3);
+    }
+    for (s = [-1, 1]) hull() {                          // arms: shoulder to hands on the grip
+        translate([s * 5.5, 8, 23]) sphere(1.6);
+        translate([s * 1.2, 4.5, 17.5]) sphere(1.3);
+    }
+    translate([0, 8, 28]) sphere(2.2);                  // head
+}
+
+// > Layering pauldrons, a belt and a crested helm
+module armor() {
+    for (s = [-1, 1]) translate([s * 5.5, 8, 23.5]) scale([1.1, 1, 0.7]) sphere(2.3);
+    translate([0, 8, 15]) scale([1.6, 1.1, 1]) cylinder(h = 1.5, r = 3);
+    difference() {
+        translate([0, 8, 28.3]) scale([1, 1.1, 1.1]) sphere(2.8);
+        translate([-2, 4, 28]) cube([4, 2, 1]);     // visor slit
+    }
+    translate([-1, 6, 30]) cube([2, 5, 3]);             // crest
+}
+
+// > Draping a weathered copper cape down the back
+module cape() {
+    difference() {
+        translate([0, 8, 5]) scale([1.3, 1, 1]) cylinder(h = 19, r1 = 5.5, r2 = 4.2);
+        translate([0, 7, 4]) scale([1.3, 1, 1]) cylinder(h = 21, r1 = 4.5, r2 = 3.2);
+        translate([-10, -2, 0]) cube([20, 11, 30]);
+    }
+}
+
+// > Planting the iron blade point-down on the pedestal
+module blade() {
+    translate([-1, 4, 5]) cube([2, 1, 11]);
+    translate([0, 4, 4]) cube([1, 1, 1]);
+}
+
+// > Forging the gold cross-guard, grip and pommel
+module hilt() {
+    translate([-3, 4, 16]) cube([6, 1, 1]);
+    translate([0, 4, 17]) cube([1, 1, 3]);
+    translate([0, 4.5, 20.5]) sphere(0.9);
+}
+
+if (part == "all" || part == "pedestal") pedestal();
+if (part == "all" || part == "body") body();
+if (part == "all" || part == "armor") armor();
+if (part == "all" || part == "cape") cape();
+if (part == "all" || part == "blade") blade();
+if (part == "all" || part == "hilt") hilt();
 ```
