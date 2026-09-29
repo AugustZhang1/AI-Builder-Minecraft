@@ -361,7 +361,7 @@ def start_room_free(
         return False
     for cmd in cmds:
         reply = rcon.command(cmd)
-        if not reply.startswith("Test passed"):
+        if "Test passed" not in reply:
             return False
     return True
 
@@ -397,7 +397,7 @@ def check_room(
             return "blocked"
         for cmd in cmds:
             reply = rcon.command(cmd)
-            if reply.startswith("Test passed"):
+            if "Test passed" in reply:
                 continue
             if "not loaded" in reply.lower():
                 return "not_loaded"
@@ -421,7 +421,7 @@ def check_grid_room(
         return False
     for cmd in cmds:
         reply = rcon.command(cmd)
-        if not reply.startswith("Test passed"):
+        if "Test passed" not in reply:
             return False
     return True
 
@@ -485,6 +485,13 @@ def format_estimate(val: float | list[build.Box]) -> str:
     return f"about {s} seconds"
 
 
+def block_rejected(reply: str) -> bool:
+    """True if the server refused a command's block (a parse error: unknown block or state).
+    Replies are checked by content, not by how they start: all RCON connections share one
+    reply buffer, so another client's output (e.g. Frank's) can be mixed into ours."""
+    return "<--[HERE]" in reply
+
+
 def place_grid(
     rcon: Rcon | None,
     player: str | None,
@@ -526,13 +533,11 @@ def place_grid(
         cmd = f"execute in {dim} run fill {wx1} {wy1} {wz1} {wx2} {wy2} {wz2} {block_to_use}"
         reply = rcon.command(cmd) if rcon else "Successfully filled"
 
-        if reply.startswith("Successfully filled") or reply.startswith("No blocks were filled"):
-            pass
-        elif "not loaded" in reply.lower():
+        if "not loaded" in reply.lower():
             raise PlacementError(
                 f"Stopped after {placed_blocks:,} blocks: the build area is no longer loaded. Stay close to it."
             )
-        else:
+        if block_rejected(reply):
             logger.warning(
                 "Block %r rejected by server (%s). Substituting %s",
                 block_to_use,
@@ -583,18 +588,18 @@ def place_details(
         cmd = f"execute in {dim} run fill {wx1} {wy1} {wz1} {wx2} {wy2} {wz2} {rotated_block}"
         reply = rcon.command(cmd) if rcon else "Successfully filled"
 
-        if reply.startswith("Successfully filled") or reply.startswith("No blocks were filled"):
-            placed += vol
-        elif "not loaded" in reply.lower():
+        if "not loaded" in reply.lower():
             raise PlacementError(
                 f"Stopped after {placed:,} blocks: the build area is no longer loaded. Stay close to it."
             )
-        else:
+        if block_rejected(reply):
             logger.warning(
                 "Detail block %r rejected by server (%s). Skipped.",
                 rotated_block,
                 reply.strip(),
             )
+        else:
+            placed += vol
 
         delay = max(config.MIN_COMMAND_DELAY, vol / config.BLOCKS_PER_SECOND)
         if STOP.wait(delay):
