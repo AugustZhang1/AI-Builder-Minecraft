@@ -798,6 +798,7 @@ def review_design(
                 preview_png,
                 image_png=image_png,
                 provider=provider,
+                stop=STOP,
             )
         finally:
             heartbeat.stop()
@@ -810,6 +811,9 @@ def review_design(
         send_fn("Review: improved the design.")
         return result
     except Exception as e:
+        if STOP.is_set():
+            logger.info("Review stopped: %s", e)
+            return None
         logger.warning("Review failed: %s", e)
         send_fn("Review failed; building the first design.")
         return None
@@ -851,6 +855,7 @@ def design_two(
                 on_text=narrator.feed if i == 0 else None,
                 provider=provider,
                 work_dir=llm._CLI_WORKDIR / "ab"[i],
+                stop=STOP,
             )
         except Exception as e:
             results[i] = e
@@ -889,7 +894,8 @@ def build_versions(
             versions.append(Version(label, build_dir if label == "A" else build_dir / "b", result[4], *rev[4:]))
         except Exception as e:
             logger.warning("Version %s failed: %s", label, e)
-            failed.append(label)
+            if not isinstance(e, llm.LlmStopped):
+                failed.append(label)
             first_error = first_error or e
     if not versions:
         raise first_error or RuntimeError("No design")
@@ -930,10 +936,14 @@ def choose_version(
             [(v.raw, (v.dir / "preview.png").read_bytes()) for v in versions],
             image_png=image_png,
             provider=provider,
+            stop=STOP,
         )
     except Exception as e:
-        logger.warning("Pick failed: %s", e)
         v = versions[0]
+        if STOP.is_set():
+            logger.info("Pick stopped: %s", e)
+            return v.grid, v.palette, v.dboxes, v.skipped, "A (stopped)"
+        logger.warning("Pick failed: %s", e)
         send_fn("Picking failed; building version A.")
         return v.grid, v.palette, v.dboxes, v.skipped, "A (the pick failed)"
     finally:
@@ -1231,6 +1241,7 @@ def run_build(
                     image_png=image_png,
                     on_text=narrator.feed,
                     provider=provider,
+                    stop=STOP,
                 )
             finally:
                 heartbeat.stop()
@@ -1283,8 +1294,14 @@ def run_build(
         design_tuple = (grid, palette, dboxes)
         LAST_DESIGNS[player.strip().lower()] = design_tuple
 
+        if STOP.is_set():
+            send_message(rcon, player, "Stopped. Type !place to build it.")
+            return
+
         place_design(rcon, player, design_tuple, origin, facing, dim, start_time, crew=crew)
 
+    except llm.LlmStopped:
+        send_message(rcon, player, "Stopped.")
     except Exception as e:
         logger.exception("Build failed for player %s: %s", player, e)
         err_str = str(e).strip()

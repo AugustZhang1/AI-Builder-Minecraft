@@ -29,6 +29,10 @@ class LlmError(Exception):
     pass
 
 
+class LlmStopped(LlmError):
+    """The AI call was stopped with !designstop."""
+
+
 logger = logging.getLogger("mcmcp")
 
 _CLI_WORKDIR = Path(tempfile.gettempdir()) / "mcmcp-cli"
@@ -337,10 +341,11 @@ def _cli_text(
     review: tuple[str, bytes] | None = None,
     work_dir: Path | None = None,
     pick: tuple[tuple[str, bytes], tuple[str, bytes]] | None = None,
+    stop: threading.Event | None = None,
 ) -> Iterator[str]:
     """Runs the Claude or Gemini CLI and yields text chunks synchronously.
     work_dir is the folder for its files (default _CLI_WORKDIR); calls that run at the same
-    time need different ones."""
+    time need different ones. If stop gets set, the CLI is killed and LlmStopped is raised."""
     if provider not in config.PROVIDERS:
         raise LlmError(f"Unknown provider: {provider!r}. Must be one of {config.PROVIDERS}")
 
@@ -407,6 +412,18 @@ def _cli_text(
     timer = threading.Timer(timeout, on_timeout)
     timer.start()
 
+    stopped = False
+    if stop is not None:
+        def watch_stop():
+            nonlocal stopped
+            while proc.poll() is None:
+                if stop.wait(0.5):
+                    stopped = True
+                    _kill_process_tree(proc)
+                    return
+
+        threading.Thread(target=watch_stop, daemon=True).start()
+
     feeder = None
     if stdin_payload is not None:
         def feed_stdin():
@@ -451,8 +468,11 @@ def _cli_text(
             feeder.join(timeout=2.0)
         _kill_process_tree(proc)
 
+    display_name = "Claude" if provider == "claude" else "Gemini"
+    if stopped:
+        raise LlmStopped(f"{display_name} stopped")
+
     if timed_out:
-        display_name = "Claude" if provider == "claude" else "Gemini"
         raise LlmError(f"{display_name} CLI timed out after {timeout}s")
 
     if proc.returncode != 0:
@@ -642,10 +662,11 @@ def design(
     on_text: Callable[[str], None] | None = None,
     provider: str = "claude",
     work_dir: Path | None = None,
+    stop: threading.Event | None = None,
 ) -> tuple[str, dict[str, str], dict[str, dict[str, float]], list[tuple[int, int, int, int, int, int, str]], str]:
     """Returns (scad_text, blocks, mix, details, raw_response).
     blocks maps part name -> block id, in precedence order (later parts override earlier ones).
-    work_dir: see _cli_text (default: the shared folder)."""
+    work_dir, stop: see _cli_text (default: the shared folder, no stop)."""
     if provider not in config.PROVIDERS:
         raise LlmError(f"Unknown provider: {provider!r}. Must be one of {config.PROVIDERS}")
 
@@ -658,6 +679,7 @@ def design(
             image_png=image_png,
             timeout=config.CLAUDE_TIMEOUT,
             provider=provider,
+            stop=stop,
             **extra,
         ):
             chunks.append(chunk)
@@ -691,6 +713,7 @@ def review(
     provider: str = "claude",
     on_text: Callable[[str], None] | None = None,
     work_dir: Path | None = None,
+    stop: threading.Event | None = None,
 ) -> tuple[str, dict[str, str], dict[str, dict[str, float]], list[tuple[int, int, int, int, int, int, str]], str] | None:
     """Reviews the build preview and either returns None (KEEP) or a corrected design 5-tuple."""
     if provider not in config.PROVIDERS:
@@ -708,6 +731,7 @@ def review(
             provider=provider,
             review=(raw, thumb_png),
             work_dir=work_dir,
+            stop=stop,
         ):
             chunks.append(chunk)
             if on_text:
@@ -730,6 +754,7 @@ def pick(
     image_png: bytes | None = None,
     provider: str = "claude",
     work_dir: Path | None = None,
+    stop: threading.Event | None = None,
 ) -> tuple[int, tuple[str, dict[str, str], dict[str, dict[str, float]], list[tuple[int, int, int, int, int, int, str]], str] | None]:
     """Picks the better of two built designs. designs is [(raw_a, preview_png_a), (raw_b, preview_png_b)].
     Returns (index, revised): index 0 (A) or 1 (B), revised None or the picked design's corrected
@@ -747,6 +772,7 @@ def pick(
             provider=provider,
             work_dir=work_dir,
             pick=thumbs,
+            stop=stop,
         ))
         m = PICK_RE.search(FENCE_RE.sub("", reply))  # not inside a design's code
         if m is None:
