@@ -65,11 +65,28 @@ IMAGE_MAX_BYTES = 8_000_000
 IMAGE_MAX_SIDE = 1568              # px, longest side sent to Claude
 
 
-def rcon_settings() -> tuple[str, int, str]:
-    """(host, port, password) read from server.properties."""
+def server_properties() -> dict[str, str]:
+    """server.properties as a dict; empty if the file is missing."""
     props = {}
-    for line in (SERVER_DIR / "server.properties").read_text(encoding="utf-8").splitlines():
+    path = SERVER_DIR / "server.properties"
+    if not path.exists():
+        return props
+    for line in path.read_text(encoding="utf-8").splitlines():
         if "=" in line and not line.startswith("#"):
             k, v = line.split("=", 1)
             props[k.strip()] = v.strip()
+    return props
+
+
+def rcon_settings() -> tuple[str, int, str]:
+    """(host, port, password) read from server.properties."""
+    props = server_properties()
     return "127.0.0.1", int(props.get("rcon.port", 25575)), props["rcon.password"]
+
+
+def view_distance() -> int:
+    """The server's view-distance in chunks (vanilla default 10)."""
+    try:
+        return int(server_properties().get("view-distance", 10))
+    except ValueError:
+        return 10

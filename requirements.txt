@@ -2,5 +2,6 @@ trimesh==5.1.0
 numpy==2.5.3
 scipy==1.18.1
 rtree==1.4.1
+embreex==4.4.0
 Pillow==12.3.0
 pytest==9.1.1
