@@ -50,8 +50,8 @@ BANNED_BLOCKS = frozenset("minecraft:" + b for b in (
 
 # Placement rate limit.
 FILL_MAX_VOLUME = 4096             # blocks per /fill command (hard game limit is 32,768)
-BLOCKS_PER_SECOND = 4000
-MIN_COMMAND_DELAY = 0.02           # seconds between placement commands
+BLOCKS_PER_SECOND = 20000
+MIN_COMMAND_DELAY = 0.002          # seconds between placement commands
 
 # !pixelart (no AI). Sizes come from the image and the free space; these are sanity caps.
 PIXELART_MAX_SIDE = 512            # px, longest side after sprite detection

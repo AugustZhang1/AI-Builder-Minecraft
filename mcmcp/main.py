@@ -485,6 +485,22 @@ def format_estimate(val: float | list[build.Box]) -> str:
     return f"about {s} seconds"
 
 
+class Pacer:
+    """Rate limit for placement commands. Waits add up and are slept once they reach one
+    game tick, since short sleeps round up to about 15 ms on Windows."""
+
+    def __init__(self) -> None:
+        self.owed = 0.0
+
+    def wait(self, vol: int) -> bool:
+        """Adds the delay for a command of vol blocks. Returns True if STOP was set."""
+        self.owed += max(config.MIN_COMMAND_DELAY, vol / config.BLOCKS_PER_SECOND)
+        if self.owed < 0.05:
+            return STOP.is_set()
+        owed, self.owed = self.owed, 0.0
+        return STOP.wait(owed)
+
+
 def block_rejected(reply: str) -> bool:
     """True if the server refused a command's block (a parse error: unknown block or state).
     Replies are checked by content, not by how they start: all RCON connections share one
@@ -518,6 +534,7 @@ def place_grid(
         logger.warning("Banned blocks replaced with %s: %s", config.FALLBACK_BLOCK, sorted(substitutions))
     placed_blocks = 0
     announced_milestones: set[int] = set()
+    pacer = Pacer()
 
     for b in fill_boxes:
         if STOP.is_set():
@@ -559,8 +576,7 @@ def place_grid(
                 announced_milestones.add(m)
                 send(f"Placing blocks... {m}%")
 
-        delay = max(config.MIN_COMMAND_DELAY, vol / config.BLOCKS_PER_SECOND)
-        if STOP.wait(delay):
+        if pacer.wait(vol):
             break
 
     return placed_blocks
@@ -576,6 +592,7 @@ def place_details(
 ) -> int:
     """Places detail boxes in list order via RCON fill commands with rotated states."""
     placed = 0
+    pacer = Pacer()
     for db in dboxes:
         if STOP.is_set():
             break
@@ -601,8 +618,7 @@ def place_details(
         else:
             placed += vol
 
-        delay = max(config.MIN_COMMAND_DELAY, vol / config.BLOCKS_PER_SECOND)
-        if STOP.wait(delay):
+        if pacer.wait(vol):
             break
 
     return placed
