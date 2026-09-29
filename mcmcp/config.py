@@ -26,6 +26,12 @@ CLAUDE_MODEL = "claude-opus-5-5"
 CLAUDE_EFFORT = "xhigh"
 CLAUDE_TIMEOUT = 900  # seconds for the whole call
 
+# Gemini through the agy CLI (Google Antigravity).
+GEMINI_MODEL = "gemini-3.8-flash-high"
+PROVIDERS = ("claude", "gemini")
+SETTINGS_FILE = WORK_DIR / "settings.json"  # {"provider": "claude" | "gemini"}, set with !designai
+HEARTBEAT_SECONDS = 30
+
 # Build limits.
 MAX_SIZE = 64                      # blocks per axis
 ROOM_SIZES = (64, 48, 32, 24, 16)  # free-space sizes tried, largest first

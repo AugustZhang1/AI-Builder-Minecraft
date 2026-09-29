@@ -31,13 +31,18 @@ BLOCK_ID_RE = re.compile(r"^minecraft:[a-z0-9_]+$")
 FENCE_RE = re.compile(r"```([a-zA-Z0-9_-]*)[^\S\r\n]*\r?\n([\s\S]*?)```")
 
 
+def _prepare_prompt_text(max_size: int) -> str:
+    """Reads mcmcp/prompt.md and substitutes {max_size}."""
+    template_path = Path(__file__).resolve().parent / "prompt.md"
+    content = template_path.read_text(encoding="utf-8")
+    return content.replace("{max_size}", str(max_size))
+
+
 def _prepare_prompt_file(max_size: int, work_dir: Path | None = None) -> Path:
     """Reads mcmcp/prompt.md, substitutes {max_size}, and writes to the temp work dir."""
     target_dir = work_dir or _CLI_WORKDIR
     target_dir.mkdir(parents=True, exist_ok=True)
-    template_path = Path(__file__).resolve().parent / "prompt.md"
-    content = template_path.read_text(encoding="utf-8")
-    content = content.replace("{max_size}", str(max_size))
+    content = _prepare_prompt_text(max_size)
     prompt_file = target_dir / "prompt.md"
     prompt_file.write_text(content, encoding="utf-8")
     return prompt_file
@@ -69,6 +74,57 @@ def _cli_command(prompt_file_or_max_size: Path | str | int | None = None) -> lis
         "--output-format", "stream-json",
         "--include-partial-messages",
         "--verbose",
+    ]
+    return cmd
+
+
+GEMINI_RULES = (
+    "Do not use any tools, except to view the reference image file named below if there is one. "
+    "Do not create or edit files. Reply only with the two fenced blocks described above."
+)
+
+
+def _build_gemini_user_text(
+    description: str,
+    max_size: int,
+    image_png: bytes | None = None,
+    ref_path: Path | None = None,
+) -> str:
+    desc = description.strip() if description else ""
+    if image_png and not desc:
+        user_text = f"Build what is shown in the image.\nMaximum size: {max_size} blocks per axis."
+    else:
+        user_text = f"Design: {desc}\nMaximum size: {max_size} blocks per axis."
+
+    if image_png:
+        target_path = (ref_path or (_CLI_WORKDIR / "ref.png")).resolve()
+        user_text += f"\nThe reference image is the file {target_path}. Look at it first."
+    return user_text
+
+
+def _build_gemini_prompt(
+    description: str,
+    max_size: int,
+    image_png: bytes | None = None,
+    ref_file: Path | None = None,
+) -> str:
+    system_prompt = _prepare_prompt_text(max_size).rstrip()
+    ref_path = (ref_file or (_CLI_WORKDIR / "ref.png")).resolve()
+    user_text = _build_gemini_user_text(description, max_size, image_png, ref_path=ref_path)
+    return f"{system_prompt}\n\n{GEMINI_RULES}\n\n{user_text}"
+
+
+def _agy_command(prompt_text: str) -> list[str]:
+    """Builds the argv for invoking the agy CLI."""
+    exe = shutil.which("agy")
+    if exe is None:
+        raise LlmError("`agy` CLI not found on PATH")
+
+    cmd = [
+        exe, "-p", prompt_text,
+        "--model", config.GEMINI_MODEL,
+        "--output-format", "stream-json",
+        "--sandbox",
     ]
     return cmd
 
@@ -126,6 +182,32 @@ def _cli_delta(event: dict) -> str | None:
     return None
 
 
+def _agy_delta(event: dict) -> str | None:
+    """Extracts text delta from an agy stream-json event or raises LlmError on error results."""
+    if not isinstance(event, dict):
+        return None
+
+    evt_type = event.get("event")
+
+    if evt_type == "result":
+        res = event.get("result")
+        if isinstance(res, dict):
+            status = res.get("status")
+            if status != "SUCCESS":
+                err = res.get("error") or status or "Unknown error"
+                raise LlmError(f"gemini: {err}")
+        return None
+
+    if evt_type == "step_update":
+        step = event.get("step_update")
+        if isinstance(step, dict) and step.get("step_type") == "agent_response":
+            delta = step.get("text_delta")
+            if isinstance(delta, str):
+                return delta
+
+    return None
+
+
 def _kill_process_tree(proc: subprocess.Popen) -> None:
     """Kills the process and any child processes."""
     if proc.poll() is not None:
@@ -153,12 +235,34 @@ def _cli_text(
     max_size: int,
     image_png: bytes | None = None,
     timeout: float = config.CLAUDE_TIMEOUT,
+    provider: str = "claude",
 ) -> Iterator[str]:
-    """Runs the Claude CLI and yields text chunks synchronously."""
+    """Runs the Claude or Gemini CLI and yields text chunks synchronously."""
+    if provider not in config.PROVIDERS:
+        raise LlmError(f"Unknown provider: {provider!r}. Must be one of {config.PROVIDERS}")
+
     _CLI_WORKDIR.mkdir(parents=True, exist_ok=True)
-    prompt_file = _prepare_prompt_file(max_size, _CLI_WORKDIR)
-    cmd = _cli_command(prompt_file)
-    stdin_payload = _build_stdin_payload(description, max_size, image_png)
+
+    if provider == "claude":
+        prompt_file = _prepare_prompt_file(max_size, _CLI_WORKDIR)
+        cmd = _cli_command(prompt_file)
+        stdin_payload: str | None = _build_stdin_payload(description, max_size, image_png)
+        stdin_mode = subprocess.PIPE
+        delta_fn = _cli_delta
+        cli_name = "claude"
+    elif provider == "gemini":
+        ref_file = _CLI_WORKDIR / "ref.png"
+        ref_file.unlink(missing_ok=True)
+        if image_png:
+            ref_file.write_bytes(image_png)
+        prompt_text = _build_gemini_prompt(description, max_size, image_png, ref_file=ref_file)
+        cmd = _agy_command(prompt_text)
+        stdin_payload = None
+        stdin_mode = subprocess.DEVNULL
+        delta_fn = _agy_delta
+        cli_name = "gemini"
+    else:
+        raise LlmError(f"Unknown provider: {provider!r}. Must be one of {config.PROVIDERS}")
 
     env = dict(os.environ)
     env.pop("ANTHROPIC_API_KEY", None)
@@ -167,7 +271,7 @@ def _cli_text(
     popen_kwargs: dict[str, Any] = {
         "cwd": _CLI_WORKDIR,
         "env": env,
-        "stdin": subprocess.PIPE,
+        "stdin": stdin_mode,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.STDOUT,
     }
@@ -186,22 +290,24 @@ def _cli_text(
     timer = threading.Timer(timeout, on_timeout)
     timer.start()
 
-    def feed_stdin():
-        try:
-            if proc.stdin:
-                proc.stdin.write(stdin_payload.encode("utf-8"))
-                proc.stdin.flush()
-        except OSError:
-            pass
-        finally:
+    feeder = None
+    if stdin_payload is not None:
+        def feed_stdin():
             try:
                 if proc.stdin:
-                    proc.stdin.close()
+                    proc.stdin.write(stdin_payload.encode("utf-8"))
+                    proc.stdin.flush()
             except OSError:
                 pass
+            finally:
+                try:
+                    if proc.stdin:
+                        proc.stdin.close()
+                except OSError:
+                    pass
 
-    feeder = threading.Thread(target=feed_stdin, daemon=True)
-    feeder.start()
+        feeder = threading.Thread(target=feed_stdin, daemon=True)
+        feeder.start()
 
     last_noise = ""
     try:
@@ -217,22 +323,24 @@ def _cli_text(
                     continue
 
                 if isinstance(event, dict):
-                    chunk = _cli_delta(event)
+                    chunk = delta_fn(event)
                     if chunk:
                         yield chunk
 
         proc.wait()
     finally:
         timer.cancel()
-        feeder.join(timeout=2.0)
+        if feeder is not None:
+            feeder.join(timeout=2.0)
         _kill_process_tree(proc)
 
     if timed_out:
-        raise LlmError(f"Claude CLI timed out after {timeout}s")
+        display_name = "Claude" if provider == "claude" else "Gemini"
+        raise LlmError(f"{display_name} CLI timed out after {timeout}s")
 
     if proc.returncode != 0:
         noise = f": {last_noise[-300:]}" if last_noise else ""
-        raise LlmError(f"claude exited with code {proc.returncode}{noise}")
+        raise LlmError(f"{cli_name} exited with code {proc.returncode}{noise}")
 
 
 def parse_reply(raw_response: str) -> tuple[str, dict[str, str]]:
@@ -299,12 +407,22 @@ def design(
     max_size: int,
     image_png: bytes | None = None,
     on_text: Callable[[str], None] | None = None,
+    provider: str = "claude",
 ) -> tuple[str, dict[str, str], str]:
     """Returns (scad_text, blocks, raw_response).
     blocks maps part name -> block id, in precedence order (later parts override earlier ones)."""
+    if provider not in config.PROVIDERS:
+        raise LlmError(f"Unknown provider: {provider!r}. Must be one of {config.PROVIDERS}")
+
     try:
         chunks: list[str] = []
-        for chunk in _cli_text(description, max_size, image_png=image_png, timeout=config.CLAUDE_TIMEOUT):
+        for chunk in _cli_text(
+            description,
+            max_size,
+            image_png=image_png,
+            timeout=config.CLAUDE_TIMEOUT,
+            provider=provider,
+        ):
             chunks.append(chunk)
             if on_text:
                 on_text(chunk)

@@ -6,7 +6,7 @@ and in-game placement via RCON.
 from __future__ import annotations
 
 import argparse
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import datetime
 import io
 import json
@@ -35,6 +35,132 @@ logger = logging.getLogger("mcmcp")
 CHAT_RE = re.compile(r"\]: (?:\[Not Secure\] )?<([A-Za-z0-9_]{3,16})> (.*)$")
 URL_RE = re.compile(r"https?://\S+")
 FRANK_RE = re.compile(r"\bfrank\b", re.IGNORECASE)
+NARRATION_RE = re.compile(r"^\s*//\s*>\s*(.+?)\s*$")
+
+PROVIDER_NAMES = {"claude": "Claude", "gemini": "Gemini"}
+
+
+def get_provider() -> str:
+    """Returns the configured AI provider ('claude' or 'gemini').
+
+    Reads config.SETTINGS_FILE. Missing/invalid file or unknown value -> 'claude'.
+    """
+    try:
+        if not config.SETTINGS_FILE.exists():
+            return "claude"
+        data = json.loads(config.SETTINGS_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            provider = data.get("provider")
+            if isinstance(provider, str) and provider.lower() in PROVIDER_NAMES:
+                return provider.lower()
+    except Exception:
+        pass
+    return "claude"
+
+
+def set_provider(name: str) -> None:
+    """Sets the AI provider in config.SETTINGS_FILE."""
+    config.SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    config.SETTINGS_FILE.write_text(
+        json.dumps({"provider": name}),
+        encoding="utf-8",
+    )
+
+
+def parse_ai_command(message: str) -> tuple[bool, str | None]:
+    """Parses a message for the !designai command.
+
+    Returns (is_command, arg_or_None).
+    """
+    msg = message.strip()
+    if not (msg.lower().startswith("!designai") and (len(msg) == 9 or msg[9].isspace())):
+        return False, None
+
+    arg = msg[9:].strip()
+    return True, arg if arg else None
+
+
+class Heartbeat:
+    """Daemon thread that periodically sends a heartbeat status message."""
+
+    def __init__(
+        self,
+        send: Callable[[str], Any],
+        name: str,
+        interval: float | int = config.HEARTBEAT_SECONDS,
+    ) -> None:
+        self.send = send
+        self.name = name
+        self.interval = interval
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._start_time = 0.0
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            self.stop()
+        self._stop_event.clear()
+        self._start_time = time.time()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop_event.wait(self.interval):
+            elapsed = max(0, int(time.time() - self._start_time))
+            mins = elapsed // 60
+            secs = elapsed % 60
+            time_str = f"{mins}m {secs}s" if mins > 0 else f"{secs}s"
+            try:
+                self.send(f"{self.name} is thinking... ({time_str})")
+            except Exception as e:
+                logger.warning("Heartbeat send failed: %s", e)
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        t = self._thread
+        if t and t.is_alive():
+            if threading.current_thread() != t:
+                t.join(timeout=1.0)
+
+
+class Narrator:
+    """Parses streaming code chunks for narration comments (// > text) and sends them."""
+
+    def __init__(
+        self,
+        send: Callable[[str], Any],
+        on_first: Callable[[], Any] | None = None,
+    ) -> None:
+        self.send = send
+        self.on_first = on_first
+        self._buf = ""
+        self._first = True
+
+    def feed(self, chunk: str) -> None:
+        self._buf += chunk
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            self._process_line(line.rstrip("\r"))
+
+    def flush(self) -> None:
+        if self._buf:
+            line = self._buf.rstrip("\r")
+            self._buf = ""
+            self._process_line(line)
+
+    def _process_line(self, line: str) -> None:
+        m = NARRATION_RE.match(line)
+        if m:
+            text = m.group(1)[:100]
+            if self._first:
+                self._first = False
+                if self.on_first:
+                    try:
+                        self.on_first()
+                    except Exception as e:
+                        logger.warning("Error in on_first callback: %s", e)
+            self.send(text)
+
 
 
 def sanitize_frank(text: str) -> str:
@@ -269,6 +395,7 @@ def run_build(
     image_url: str | None = None,
     scad_override: str | None = None,
     blocks_override: dict[str, str] | None = None,
+    ai: str | None = None,
 ) -> None:
     """Executes the full in-game design and build pipeline."""
     start_time = time.time()
@@ -296,7 +423,13 @@ def run_build(
             return
 
         # 3. Designing announcement and image download
-        send_message(rcon, player, f"Designing (up to {S} blocks). This takes a few minutes...")
+        provider = (ai.lower() if ai else None) or get_provider()
+        provider_name = PROVIDER_NAMES.get(provider, provider.capitalize())
+        send_message(
+            rcon,
+            player,
+            f"Designing with {provider_name} (up to {S} blocks). This takes a few minutes...",
+        )
         image_png: bytes | None = None
         if image_url:
             try:
@@ -312,14 +445,28 @@ def run_build(
             blocks = blocks_override
             raw = "// OpenSCAD design and blocks provided via flags\n"
         else:
-            scad, blocks, raw = llm.design(description, S, image_png)
+            send_fn = lambda msg: send_message(rcon, player, msg)
+            heartbeat = Heartbeat(send_fn, provider_name, config.HEARTBEAT_SECONDS)
+            narrator = Narrator(send_fn, on_first=heartbeat.stop)
+            heartbeat.start()
+            try:
+                scad, blocks, raw = llm.design(
+                    description,
+                    S,
+                    image_png=image_png,
+                    on_text=narrator.feed,
+                    provider=provider,
+                )
+            finally:
+                heartbeat.stop()
+            narrator.flush()
 
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         build_dir = config.WORK_DIR / f"{timestamp}-{player}"
         build_dir.mkdir(parents=True, exist_ok=True)
 
         (build_dir / "request.txt").write_text(
-            f"Player: {player}\nSize: {S}\nImage: {image_url or ''}\nDescription: {description}\n",
+            f"Player: {player}\nProvider: {provider}\nSize: {S}\nImage: {image_url or ''}\nDescription: {description}\n",
             encoding="utf-8",
         )
         (build_dir / "response.txt").write_text(raw, encoding="utf-8")
@@ -409,6 +556,7 @@ def run_offline_build(
     size: int = 32,
     scad_file: str | None = None,
     blocks_file: str | None = None,
+    ai: str | None = None,
 ) -> None:
     """Executes design, rendering, and voxelization without RCON, printing results and timings."""
     t_total_start = time.time()
@@ -416,6 +564,7 @@ def run_offline_build(
     if image_url:
         image_png = load_image_png(image_url)
 
+    provider = (ai.lower() if ai else None) or get_provider()
     if scad_file and blocks_file:
         scad = Path(scad_file).read_text(encoding="utf-8")
         blocks_data = json.loads(Path(blocks_file).read_text(encoding="utf-8"))
@@ -423,7 +572,12 @@ def run_offline_build(
         t_design = 0.0
     else:
         t0 = time.time()
-        scad, blocks, _raw = llm.design(description, size, image_png)
+        scad, blocks, _raw = llm.design(
+            description,
+            size,
+            image_png=image_png,
+            provider=provider,
+        )
         t_design = time.time() - t0
 
     build_dir = config.WORK_DIR / f"offline-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
@@ -497,6 +651,69 @@ def tail_log(log_path: Path) -> Iterator[str]:
                 prev_size = cur_stat.st_size
 
 
+def handle_chat_line(
+    player: str,
+    message: str,
+    rcon: Rcon | None = None,
+    build_lock: threading.Lock | None = None,
+) -> None:
+    is_ai_cmd, ai_arg = parse_ai_command(message)
+    if is_ai_cmd:
+        if not is_op(player, config.OPS_FILE):
+            send_message(rcon, player, "Only ops can use !designai.")
+            return
+
+        if ai_arg is None:
+            cur = get_provider()
+            display = PROVIDER_NAMES.get(cur, "Claude")
+            send_message(rcon, player, f"AI: {display}")
+            return
+
+        choice = ai_arg.lower()
+        if choice in PROVIDER_NAMES:
+            set_provider(choice)
+            send_message(rcon, player, f"AI set to {PROVIDER_NAMES[choice]}.")
+        else:
+            send_message(rcon, player, "Usage: !designai claude|gemini")
+        return
+
+    is_cmd, desc, img_url = parse_command(message)
+    if not is_cmd:
+        return
+
+    logger.info("Command from %s: desc=%r img=%r", player, desc, img_url)
+
+    if not is_op(player, config.OPS_FILE):
+        send_message(rcon, player, "Only ops can use !design.")
+        return
+
+    if not desc and not img_url:
+        send_message(
+            rcon,
+            player,
+            "Usage: !design <description>  or  !design <image link> <description>",
+        )
+        return
+
+    if build_lock is not None and not build_lock.acquire(blocking=False):
+        send_message(
+            rcon,
+            player,
+            "A build is already running. Try again when it finishes.",
+        )
+        return
+
+    def worker():
+        try:
+            run_build(rcon, player, desc, image_url=img_url)
+        finally:
+            if build_lock is not None:
+                build_lock.release()
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -509,6 +726,13 @@ def main() -> None:
     parser.add_argument("--size", type=int, default=32, help="Max size when no --player (default 32)")
     parser.add_argument("--scad", type=str, default=None, help="OpenSCAD file to use (skip Claude)")
     parser.add_argument("--blocks", type=str, default=None, help="Blocks JSON file to use (skip Claude)")
+    parser.add_argument(
+        "--ai",
+        type=str,
+        choices=["claude", "gemini"],
+        default=None,
+        help="AI provider override for this run",
+    )
 
     args = parser.parse_args()
 
@@ -532,6 +756,7 @@ def main() -> None:
                 image_url=args.image,
                 scad_override=scad_override,
                 blocks_override=blocks_override,
+                ai=args.ai,
             )
         else:
             run_offline_build(
@@ -540,6 +765,7 @@ def main() -> None:
                 size=args.size,
                 scad_file=args.scad,
                 blocks_file=args.blocks,
+                ai=args.ai,
             )
         return
 
@@ -547,49 +773,13 @@ def main() -> None:
     rcon = Rcon(*config.rcon_settings())
     build_lock = threading.Lock()
 
-    def handle_chat_line(player: str, message: str) -> None:
-        is_cmd, desc, img_url = parse_command(message)
-        if not is_cmd:
-            return
-
-        logger.info("Command from %s: desc=%r img=%r", player, desc, img_url)
-
-        if not is_op(player, config.OPS_FILE):
-            send_message(rcon, player, "Only ops can use !design.")
-            return
-
-        if not desc and not img_url:
-            send_message(
-                rcon,
-                player,
-                "Usage: !design <description>  or  !design <image link> <description>",
-            )
-            return
-
-        if not build_lock.acquire(blocking=False):
-            send_message(
-                rcon,
-                player,
-                "A build is already running. Try again when it finishes.",
-            )
-            return
-
-        def worker():
-            try:
-                run_build(rcon, player, desc, image_url=img_url)
-            finally:
-                build_lock.release()
-
-        t = threading.Thread(target=worker, daemon=True)
-        t.start()
-
     logger.info("Starting mcmcp service, tailing %s...", config.LOG_FILE)
     try:
         for raw_line in tail_log(config.LOG_FILE):
             parsed = parse_chat_line(raw_line)
             if parsed:
                 player_name, chat_msg = parsed
-                handle_chat_line(player_name, chat_msg)
+                handle_chat_line(player_name, chat_msg, rcon=rcon, build_lock=build_lock)
     except KeyboardInterrupt:
         logger.info("Service stopped by user.")
 
