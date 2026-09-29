@@ -25,10 +25,10 @@ import numpy as np
 from PIL import Image
 
 try:
-    from . import build, config, llm, pixelart, preview
+    from . import animate, build, config, llm, pixelart, preview
     from .rcon import Rcon, RconError
 except ImportError:
-    from mcmcp import build, config, llm, pixelart, preview
+    from mcmcp import animate, build, config, llm, pixelart, preview
     from mcmcp.rcon import Rcon, RconError
 
 logger = logging.getLogger("mcmcp")
@@ -49,45 +49,73 @@ PROVIDER_NAMES = {"claude": "Claude", "gemini": "Gemini"}
 
 LAST_DESIGNS: dict[str, tuple[np.ndarray, list[str], list[tuple[int, int, int, int, int, int, str]]]] = {}
 
+HELP_LINES = (
+    "Commands (ops only):",
+    "!design <description> - the AI designs it and builds it in front of you",
+    "!design <image link> <description> - the same, using the picture as a reference",
+    "!place - builds your last design again where you stand (no AI)",
+    "!pixelart <image link> [width] - builds the picture as a flat wall (no AI)",
+    "!designstop - stops the build that is running",
+    "!designai [claude|gemini] - shows or switches the AI",
+    "!designanim [on|off] - shows or switches the builder crew animation",
+    "!designhelp - shows this list",
+)
+
+
+def load_settings() -> dict[str, Any]:
+    """Reads config.SETTINGS_FILE ({"provider": ..., "animate": ...}); missing or invalid -> {}."""
+    try:
+        data = json.loads(config.SETTINGS_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_setting(key: str, value: Any) -> None:
+    """Sets one key in config.SETTINGS_FILE, keeping the others."""
+    data = load_settings()
+    data[key] = value
+    config.SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    config.SETTINGS_FILE.write_text(json.dumps(data), encoding="utf-8")
+
 
 def get_provider() -> str:
-    """Returns the configured AI provider ('claude' or 'gemini').
-
-    Reads config.SETTINGS_FILE. Missing/invalid file or unknown value -> 'claude'.
-    """
-    try:
-        if not config.SETTINGS_FILE.exists():
-            return "claude"
-        data = json.loads(config.SETTINGS_FILE.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            provider = data.get("provider")
-            if isinstance(provider, str) and provider.lower() in PROVIDER_NAMES:
-                return provider.lower()
-    except Exception:
-        pass
+    """Returns the configured AI provider ('claude' or 'gemini'); unknown or missing -> 'claude'."""
+    provider = load_settings().get("provider")
+    if isinstance(provider, str) and provider.lower() in PROVIDER_NAMES:
+        return provider.lower()
     return "claude"
 
 
 def set_provider(name: str) -> None:
     """Sets the AI provider in config.SETTINGS_FILE."""
-    config.SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    config.SETTINGS_FILE.write_text(
-        json.dumps({"provider": name}),
-        encoding="utf-8",
-    )
+    save_setting("provider", name)
+
+
+def get_animate() -> bool:
+    """Whether !design uses the builder crew animation (set with !designanim; default config.ANIMATE)."""
+    value = load_settings().get("animate")
+    return value if isinstance(value, bool) else config.ANIMATE
+
+
+def _parse_word_command(message: str, word: str) -> tuple[bool, str | None]:
+    """Parses `word [arg]` (case-insensitive). Returns (is_command, arg_or_None)."""
+    msg = message.strip()
+    n = len(word)
+    if not (msg.lower().startswith(word) and (len(msg) == n or msg[n].isspace())):
+        return False, None
+    arg = msg[n:].strip()
+    return True, arg if arg else None
 
 
 def parse_ai_command(message: str) -> tuple[bool, str | None]:
-    """Parses a message for the !designai command.
+    """Parses a message for the !designai command. Returns (is_command, arg_or_None)."""
+    return _parse_word_command(message, "!designai")
 
-    Returns (is_command, arg_or_None).
-    """
-    msg = message.strip()
-    if not (msg.lower().startswith("!designai") and (len(msg) == 9 or msg[9].isspace())):
-        return False, None
 
-    arg = msg[9:].strip()
-    return True, arg if arg else None
+def parse_anim_command(message: str) -> tuple[bool, str | None]:
+    """Parses a message for the !designanim command. Returns (is_command, arg_or_None)."""
+    return _parse_word_command(message, "!designanim")
 
 
 def parse_place_command(message: str) -> bool:
@@ -411,10 +439,12 @@ def check_grid_room(
     facing: str,
     dim: str,
     grid_shape: tuple[int, int, int],
+    grow: int = 0,
 ) -> bool:
-    """Verifies that the final voxelized grid bounding box is free of blocks."""
+    """Verifies that the final voxelized grid bounding box, grown by `grow` blocks on each
+    side (not up or down), is free of blocks."""
     sx, sy, sz = grid_shape
-    real_box = (0, 0, 1, sx - 1, sy - 1, sz - 1, 0)
+    real_box = (-grow, -grow, 1, sx - 1 + grow, sy - 1 + grow, sz - 1, 0)
     x1, y1, z1, x2, y2, z2 = build.box_to_world(real_box, sx, origin, facing, config.GAP)
     cmds = room_check_commands(dim, x1, y1, z1, x2, y2, z2)
     if not cmds:
@@ -517,8 +547,11 @@ def place_grid(
     facing: str,
     dim: str,
     send: Callable[[str], Any],
+    driver: Callable[[list[build.Box], Callable[[build.Box], int]], Any] | None = None,
 ) -> int:
-    """Places a voxelized grid into the world via RCON /fill commands."""
+    """Places a voxelized grid into the world via RCON /fill commands.
+    With a driver (the build animation), driver(boxes, place_one) decides the order and the
+    pace; place_one(box) places one box and returns its block count."""
     solid_count = int(np.count_nonzero(grid))
     if solid_count == 0:
         return 0
@@ -536,10 +569,8 @@ def place_grid(
     announced_milestones: set[int] = set()
     pacer = Pacer()
 
-    for b in fill_boxes:
-        if STOP.is_set():
-            break
-
+    def place_one(b: build.Box) -> int:
+        nonlocal placed_blocks
         bx1, by1, bz1, bx2, by2, bz2, val = b
         vol = (bx2 - bx1 + 1) * (by2 - by1 + 1) * (bz2 - bz1 + 1)
         orig_block = palette[val]
@@ -575,7 +606,16 @@ def place_grid(
             if pct >= m and m not in announced_milestones:
                 announced_milestones.add(m)
                 send(f"Placing blocks... {m}%")
+        return vol
 
+    if driver is not None:
+        driver(fill_boxes, place_one)
+        return placed_blocks
+
+    for b in fill_boxes:
+        if STOP.is_set():
+            break
+        vol = place_one(b)
         if pacer.wait(vol):
             break
 
@@ -681,8 +721,12 @@ def place_design(
     facing: str,
     dim: str,
     start_time: float,
+    crew: animate.Crew | None = None,
 ) -> None:
-    """Room check, placing and completion messages shared by run_build and run_place."""
+    """Room check, placing and completion messages shared by run_build and run_place.
+    With a crew (the !design animation), scaffolding goes up first if the ring around the build
+    is free too, the crew places the build tile by tile, and the scaffolding comes down again
+    before the detail blocks."""
     grid, palette, dboxes = design
 
     # 1. Room check on the real design
@@ -711,16 +755,28 @@ def place_design(
     send_message(rcon, player, f"Placing {total_blocks:,} blocks...")
 
     # 3. Placing main grid
-    placed_main = place_grid(
-        rcon,
-        player,
-        grid,
-        palette,
-        origin,
-        facing,
-        dim,
-        lambda msg: send_message(rcon, player, msg),
-    )
+    driver = None
+    scaffold: animate.Scaffold | None = None
+    if crew is not None:
+        if check_grid_room(rcon, origin, facing, dim, grid.shape, grow=1):
+            scaffold = animate.Scaffold(rcon, dim, origin, facing, grid.shape)
+            scaffold.raise_(STOP.wait)
+        driver = lambda boxes, place_one: crew.build(grid.shape, boxes, place_one, STOP.wait)
+    try:
+        placed_main = place_grid(
+            rcon,
+            player,
+            grid,
+            palette,
+            origin,
+            facing,
+            dim,
+            lambda msg: send_message(rcon, player, msg),
+            driver=driver,
+        )
+    finally:
+        if scaffold is not None:
+            scaffold.lower()
 
     # 4. Placing details
     placed_details = 0
@@ -807,6 +863,8 @@ def run_build(
     """Executes the full in-game design and build pipeline."""
     STOP.clear()
     start_time = time.time()
+    crew: animate.Crew | None = None
+    survey: animate.Survey | None = None
     try:
         # 1. Player info via RCON
         pos_reply = rcon.command(f"data get entity {player} Pos")
@@ -836,6 +894,14 @@ def run_build(
                 "Not enough room here. Stand on open, flat ground and try again.",
             )
             return
+
+        # Animation: builders stand at the start plot and its corners are marked while the AI designs
+        if get_animate():
+            rcon.command(animate.kill_crew_command())
+            crew = animate.Crew(rcon, dim, player, origin, facing, config.CREW_SIZE)
+            crew.summon(config.START_ROOM)
+            survey = animate.Survey(rcon, animate.corner_particle_commands(dim, origin, facing, config.START_ROOM))
+            survey.start()
 
         # 4. Designing announcement and image download
         provider = (ai.lower() if ai else None) or get_provider()
@@ -875,6 +941,8 @@ def run_build(
             finally:
                 heartbeat.stop()
             narrator.flush()
+        if survey is not None:
+            survey.stop()
 
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         build_dir = config.WORK_DIR / f"{timestamp}-{player}"
@@ -902,7 +970,7 @@ def run_build(
         design_tuple = (grid, palette, dboxes)
         LAST_DESIGNS[player.strip().lower()] = design_tuple
 
-        place_design(rcon, player, design_tuple, origin, facing, dim, start_time)
+        place_design(rcon, player, design_tuple, origin, facing, dim, start_time, crew=crew)
 
     except Exception as e:
         logger.exception("Build failed for player %s: %s", player, e)
@@ -911,6 +979,12 @@ def run_build(
         if len(reason) > 100:
             reason = reason[:97] + "..."
         send_message(rcon, player, f"Build failed: {reason}")
+    finally:
+        # Errors, refusals and !designstop all end here, so nothing is left behind.
+        if survey is not None:
+            survey.stop()
+        if crew is not None:
+            crew.remove()
 
 
 def run_offline_build(
@@ -1031,6 +1105,11 @@ def tail_log(log_path: Path) -> Iterator[str]:
 def parse_stop_command(message: str) -> bool:
     """Parses a message for the !designstop command (case-insensitive, exact word)."""
     return message.strip().lower() == "!designstop"
+
+
+def parse_help_command(message: str) -> bool:
+    """Parses a message for the !designhelp command (case-insensitive, exact word)."""
+    return message.strip().lower() == "!designhelp"
 
 
 def parse_pixelart_command(message: str) -> tuple[bool, str | None, int | None]:
@@ -1249,6 +1328,26 @@ def handle_chat_line(
     rcon: Rcon | None = None,
     build_lock: threading.Lock | None = None,
 ) -> None:
+    if parse_help_command(message):
+        # Anyone may ask; it only lists the commands (which stay op-only).
+        for line in HELP_LINES:
+            send_message(rcon, player, line)
+        return
+
+    is_anim_cmd, anim_arg = parse_anim_command(message)
+    if is_anim_cmd:
+        if not is_op(player, config.OPS_FILE):
+            send_message(rcon, player, "Only ops can use !designanim.")
+            return
+        if anim_arg is None:
+            send_message(rcon, player, f"Builder animation: {'on' if get_animate() else 'off'}.")
+        elif anim_arg.lower() in ("on", "off"):
+            save_setting("animate", anim_arg.lower() == "on")
+            send_message(rcon, player, f"Builder animation turned {anim_arg.lower()}.")
+        else:
+            send_message(rcon, player, "Usage: !designanim on|off")
+        return
+
     if parse_stop_command(message):
         if not is_op(player, config.OPS_FILE):
             send_message(rcon, player, "Only ops can use !designstop.")
@@ -1445,6 +1544,10 @@ def main() -> None:
     # Service mode
     rcon = Rcon(*config.rcon_settings())
     build_lock = threading.Lock()
+    try:
+        rcon.command(animate.kill_crew_command())  # builders left over from a crash
+    except Exception as e:
+        logger.warning("Couldn't remove leftover builders: %s", e)
 
     logger.info("Starting mcmcp service, tailing %s...", config.LOG_FILE)
     try:

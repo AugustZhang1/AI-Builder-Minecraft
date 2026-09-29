@@ -36,6 +36,8 @@ HEARTBEAT_SECONDS = 30
 START_ROOM = 16                    # the quick free-space check before designing
 GAP = 3                            # blocks between the player and the build's front
 FALLBACK_BLOCK = "minecraft:stone"
+ANIMATE = True                     # !design: builders, corner markers and scaffolding (animate.py)
+CREW_SIZE = 3                      # armor-stand builders
 # Never placed; swapped for FALLBACK_BLOCK. Fluids and fire, TNT, falling blocks (plus every
 # *_concrete_powder), portals, blocks survival players can't break, and spawners.
 BANNED_BLOCKS = frozenset("minecraft:" + b for b in (
