@@ -118,6 +118,21 @@ REVIEW_TEXT = (
     "in the same two fenced blocks (same rules and limits), keeping everything that already works."
 )
 
+FIX_TEXT = (
+    "Your design was built. The image is a preview of the result as blocks: "
+    "two angled views, then front, side and top views (the player sees the front). "
+    "The player wants these changes: {feedback}\n"
+    "Make them and reply with the complete changed design in the same two fenced blocks "
+    "(same rules and limits), keeping everything else as it is."
+)
+
+
+def _review_text(feedback: str | None) -> str:
+    """REVIEW_TEXT, or FIX_TEXT when the player asked for changes."""
+    if feedback is None or not feedback.strip():
+        return REVIEW_TEXT
+    return FIX_TEXT.format(feedback=feedback.strip())
+
 
 PICK_TEXT = (
     "Two designs were built from this request: design A and design B. "
@@ -140,6 +155,7 @@ def _build_gemini_user_text(
     review: tuple[str, bytes] | None = None,
     pick: tuple[tuple[str, bytes], tuple[str, bytes]] | None = None,
     work_dir: Path | None = None,
+    feedback: str | None = None,
 ) -> str:
     work = (work_dir or _CLI_WORKDIR).resolve()
     desc = description.strip() if description else ""
@@ -157,7 +173,7 @@ def _build_gemini_user_text(
         user_text += (
             f"\n\nYour design is the file {work / 'design.txt'}."
             f"\nThe preview image is the file {work / 'preview.png'}. Look at both first."
-            f"\n\n{REVIEW_TEXT}"
+            f"\n\n{_review_text(feedback)}"
         )
     if pick:
         user_text += (
@@ -176,10 +192,11 @@ def _build_gemini_prompt(
     review: tuple[str, bytes] | None = None,
     pick: tuple[tuple[str, bytes], tuple[str, bytes]] | None = None,
     work_dir: Path | None = None,
+    feedback: str | None = None,
 ) -> str:
     system_prompt = _prepare_prompt_text().rstrip()
     user_text = _build_gemini_user_text(
-        description, limits, image_png, review=review, pick=pick, work_dir=work_dir
+        description, limits, image_png, review=review, pick=pick, work_dir=work_dir, feedback=feedback
     )
     return f"{system_prompt}\n\n{GEMINI_RULES}\n\n{user_text}"
 
@@ -217,6 +234,7 @@ def _build_stdin_payload(
     image_png: bytes | None = None,
     review: tuple[str, bytes] | None = None,
     pick: tuple[tuple[str, bytes], tuple[str, bytes]] | None = None,
+    feedback: str | None = None,
 ) -> str:
     """Formats the single stream-json line for stdin."""
     desc = description.strip() if description else ""
@@ -243,7 +261,7 @@ def _build_stdin_payload(
         content.append(_image_part(preview_png))
         content.append({
             "type": "text",
-            "text": REVIEW_TEXT,
+            "text": _review_text(feedback),
         })
 
     if pick:
@@ -342,6 +360,7 @@ def _cli_text(
     work_dir: Path | None = None,
     pick: tuple[tuple[str, bytes], tuple[str, bytes]] | None = None,
     stop: threading.Event | None = None,
+    feedback: str | None = None,
 ) -> Iterator[str]:
     """Runs the Claude or Gemini CLI and yields text chunks synchronously.
     work_dir is the folder for its files (default _CLI_WORKDIR); calls that run at the same
@@ -356,7 +375,7 @@ def _cli_text(
         prompt_file = _prepare_prompt_file(work)
         cmd = _cli_command(prompt_file)
         stdin_payload: str | None = _build_stdin_payload(
-            description, limits, image_png=image_png, review=review, pick=pick
+            description, limits, image_png=image_png, review=review, pick=pick, feedback=feedback
         )
         stdin_mode = subprocess.PIPE
         delta_fn = _cli_delta
@@ -376,7 +395,7 @@ def _cli_text(
                 (work / f"design_{label}.txt").write_text(raw, encoding="utf-8")
                 (work / f"preview_{label}.png").write_bytes(preview_png)
         prompt_text = _build_gemini_prompt(
-            description, limits, image_png, review=review, pick=pick, work_dir=work
+            description, limits, image_png, review=review, pick=pick, work_dir=work, feedback=feedback
         )
         cmd = _agy_command(prompt_text)
         stdin_payload = None
@@ -714,8 +733,10 @@ def review(
     on_text: Callable[[str], None] | None = None,
     work_dir: Path | None = None,
     stop: threading.Event | None = None,
+    feedback: str | None = None,
 ) -> tuple[str, dict[str, str], dict[str, dict[str, float]], list[tuple[int, int, int, int, int, int, str]], str] | None:
-    """Reviews the build preview and either returns None (KEEP) or a corrected design 5-tuple."""
+    """Reviews the build preview and either returns None (KEEP) or a corrected design 5-tuple.
+    With feedback the AI makes the player's changes instead; a KEEP reply still returns None."""
     if provider not in config.PROVIDERS:
         raise LlmError(f"Unknown provider: {provider!r}. Must be one of {config.PROVIDERS}")
 
@@ -732,6 +753,7 @@ def review(
             review=(raw, thumb_png),
             work_dir=work_dir,
             stop=stop,
+            feedback=feedback,
         ):
             chunks.append(chunk)
             if on_text:
