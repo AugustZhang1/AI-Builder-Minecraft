@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
+import math
 import os
 import re
 import shutil
@@ -24,38 +26,47 @@ class LlmError(Exception):
     pass
 
 
+logger = logging.getLogger("mcmcp")
+
 _CLI_WORKDIR = Path(tempfile.gettempdir()) / "mcmcp-cli"
 
 PART_RE = re.compile(r"^[a-z0-9_]{1,32}$")
 BLOCK_ID_RE = re.compile(r"^minecraft:[a-z0-9_]+$")
+DETAIL_RE = re.compile(r"^minecraft:[a-z0-9_]+(\[[a-z0-9_]+=[a-z0-9_]+(,[a-z0-9_]+=[a-z0-9_]+)*\])?$")
 FENCE_RE = re.compile(r"```([a-zA-Z0-9_-]*)[^\S\r\n]*\r?\n([\s\S]*?)```")
 
 
-def _prepare_prompt_text(max_size: int) -> str:
-    """Reads mcmcp/prompt.md and substitutes {max_size}."""
+def _limits_line(limits: tuple[int, int, int] | int) -> str:
+    """The limits sentence of the user text; an int means the same limit on all three axes."""
+    w, d, t = (limits, limits, limits) if isinstance(limits, int) else limits
+    return (
+        f"Limits: up to {w} blocks wide (X), {d} deep (Y) and {t} tall (Z). "
+        "Build at the size the description asks for; if it gives none, pick a size that suits the subject."
+    )
+
+
+def _prepare_prompt_text() -> str:
+    """Reads mcmcp/prompt.md."""
     template_path = Path(__file__).resolve().parent / "prompt.md"
-    content = template_path.read_text(encoding="utf-8")
-    return content.replace("{max_size}", str(max_size))
+    return template_path.read_text(encoding="utf-8")
 
 
-def _prepare_prompt_file(max_size: int, work_dir: Path | None = None) -> Path:
-    """Reads mcmcp/prompt.md, substitutes {max_size}, and writes to the temp work dir."""
+def _prepare_prompt_file(work_dir: Path | None = None) -> Path:
+    """Reads mcmcp/prompt.md and writes to the temp work dir."""
     target_dir = work_dir or _CLI_WORKDIR
     target_dir.mkdir(parents=True, exist_ok=True)
-    content = _prepare_prompt_text(max_size)
+    content = _prepare_prompt_text()
     prompt_file = target_dir / "prompt.md"
     prompt_file.write_text(content, encoding="utf-8")
     return prompt_file
 
 
-def _cli_command(prompt_file_or_max_size: Path | str | int | None = None) -> list[str]:
+def _cli_command(prompt_file: Path | str | None = None) -> list[str]:
     """Builds the argv for invoking the claude CLI."""
-    if prompt_file_or_max_size is None:
-        prompt_file = _prepare_prompt_file(config.MAX_SIZE)
-    elif isinstance(prompt_file_or_max_size, int):
-        prompt_file = _prepare_prompt_file(prompt_file_or_max_size)
+    if prompt_file is None:
+        p_file = _prepare_prompt_file()
     else:
-        prompt_file = Path(prompt_file_or_max_size)
+        p_file = Path(prompt_file)
 
     exe = shutil.which("claude")
     if exe is None:
@@ -65,7 +76,7 @@ def _cli_command(prompt_file_or_max_size: Path | str | int | None = None) -> lis
         exe, "-p",
         "--model", config.CLAUDE_MODEL,
         "--effort", config.CLAUDE_EFFORT,
-        "--system-prompt-file", str(prompt_file),
+        "--system-prompt-file", str(p_file),
         "--tools", "",
         "--strict-mcp-config",
         "--setting-sources", "",
@@ -86,15 +97,16 @@ GEMINI_RULES = (
 
 def _build_gemini_user_text(
     description: str,
-    max_size: int,
+    limits: tuple[int, int, int] | int,
     image_png: bytes | None = None,
     ref_path: Path | None = None,
 ) -> str:
     desc = description.strip() if description else ""
+    limits_line = _limits_line(limits)
     if image_png and not desc:
-        user_text = f"Build what is shown in the image.\nMaximum size: {max_size} blocks per axis."
+        user_text = f"Build what is shown in the image.\n{limits_line}"
     else:
-        user_text = f"Design: {desc}\nMaximum size: {max_size} blocks per axis."
+        user_text = f"Design: {desc}\n{limits_line}"
 
     if image_png:
         target_path = (ref_path or (_CLI_WORKDIR / "ref.png")).resolve()
@@ -104,13 +116,13 @@ def _build_gemini_user_text(
 
 def _build_gemini_prompt(
     description: str,
-    max_size: int,
+    limits: tuple[int, int, int] | int,
     image_png: bytes | None = None,
     ref_file: Path | None = None,
 ) -> str:
-    system_prompt = _prepare_prompt_text(max_size).rstrip()
+    system_prompt = _prepare_prompt_text().rstrip()
     ref_path = (ref_file or (_CLI_WORKDIR / "ref.png")).resolve()
-    user_text = _build_gemini_user_text(description, max_size, image_png, ref_path=ref_path)
+    user_text = _build_gemini_user_text(description, limits, image_png, ref_path=ref_path)
     return f"{system_prompt}\n\n{GEMINI_RULES}\n\n{user_text}"
 
 
@@ -129,13 +141,18 @@ def _agy_command(prompt_text: str) -> list[str]:
     return cmd
 
 
-def _build_stdin_payload(description: str, max_size: int, image_png: bytes | None = None) -> str:
+def _build_stdin_payload(
+    description: str,
+    limits: tuple[int, int, int] | int,
+    image_png: bytes | None = None,
+) -> str:
     """Formats the single stream-json line for stdin."""
     desc = description.strip() if description else ""
+    limits_line = _limits_line(limits)
     if image_png and not desc:
-        user_text = f"Build what is shown in the image.\nMaximum size: {max_size} blocks per axis."
+        user_text = f"Build what is shown in the image.\n{limits_line}"
     else:
-        user_text = f"Design: {desc}\nMaximum size: {max_size} blocks per axis."
+        user_text = f"Design: {desc}\n{limits_line}"
 
     content: list[dict[str, Any]] = []
     if image_png:
@@ -232,7 +249,7 @@ def _kill_process_tree(proc: subprocess.Popen) -> None:
 
 def _cli_text(
     description: str,
-    max_size: int,
+    limits: tuple[int, int, int] | int,
     image_png: bytes | None = None,
     timeout: float = config.CLAUDE_TIMEOUT,
     provider: str = "claude",
@@ -244,9 +261,9 @@ def _cli_text(
     _CLI_WORKDIR.mkdir(parents=True, exist_ok=True)
 
     if provider == "claude":
-        prompt_file = _prepare_prompt_file(max_size, _CLI_WORKDIR)
+        prompt_file = _prepare_prompt_file(_CLI_WORKDIR)
         cmd = _cli_command(prompt_file)
-        stdin_payload: str | None = _build_stdin_payload(description, max_size, image_png)
+        stdin_payload: str | None = _build_stdin_payload(description, limits, image_png)
         stdin_mode = subprocess.PIPE
         delta_fn = _cli_delta
         cli_name = "claude"
@@ -255,7 +272,7 @@ def _cli_text(
         ref_file.unlink(missing_ok=True)
         if image_png:
             ref_file.write_bytes(image_png)
-        prompt_text = _build_gemini_prompt(description, max_size, image_png, ref_file=ref_file)
+        prompt_text = _build_gemini_prompt(description, limits, image_png, ref_file=ref_file)
         cmd = _agy_command(prompt_text)
         stdin_payload = None
         stdin_mode = subprocess.DEVNULL
@@ -343,10 +360,123 @@ def _cli_text(
         raise LlmError(f"{cli_name} exited with code {proc.returncode}{noise}")
 
 
-def parse_reply(raw_response: str) -> tuple[str, dict[str, str]]:
+def is_banned(block_id: str) -> bool:
+    """True if base block id (before '[') is in config.BANNED_BLOCKS or ends with '_concrete_powder'."""
+    if not isinstance(block_id, str):
+        return True
+    base_id = block_id.split("[", 1)[0].strip()
+    return base_id in config.BANNED_BLOCKS or base_id.endswith("_concrete_powder")
+
+
+def parse_mix(raw: Any) -> dict[str, dict[str, float]]:
+    """Parse and validate texture mixes. An invalid mix is dropped and logged."""
+    if not isinstance(raw, dict):
+        logger.warning("Invalid mix: expected object/dict, got %s", type(raw).__name__)
+        return {}
+
+    result: dict[str, dict[str, float]] = {}
+    for base_id, variants in raw.items():
+        if not isinstance(base_id, str) or not BLOCK_ID_RE.match(base_id):
+            logger.warning("Dropping mix: invalid base block id %r", base_id)
+            continue
+        if is_banned(base_id):
+            logger.warning("Dropping mix: banned base block id %r", base_id)
+            continue
+        if not isinstance(variants, dict):
+            logger.warning("Dropping mix for %r: variants must be a dict, got %s", base_id, type(variants).__name__)
+            continue
+        if not (1 <= len(variants) <= 6):
+            logger.warning("Dropping mix for %r: expected 1-6 variants, got %d", base_id, len(variants))
+            continue
+
+        valid = True
+        parsed_variants: dict[str, float] = {}
+        for var_id, weight in variants.items():
+            if not isinstance(var_id, str) or not BLOCK_ID_RE.match(var_id):
+                logger.warning("Dropping mix for %r: invalid variant id %r", base_id, var_id)
+                valid = False
+                break
+            if is_banned(var_id):
+                logger.warning("Dropping mix for %r: banned variant id %r", base_id, var_id)
+                valid = False
+                break
+            if isinstance(weight, bool) or not isinstance(weight, (int, float)) or weight <= 0 or not math.isfinite(weight):
+                logger.warning("Dropping mix for %r: invalid weight %r for variant %r", base_id, weight, var_id)
+                valid = False
+                break
+            parsed_variants[var_id] = float(weight)
+
+        if valid:
+            result[base_id] = parsed_variants
+
+    return result
+
+
+def parse_details(raw: Any) -> list[tuple[int, int, int, int, int, int, str]]:
+    """Parse and validate detail blocks/boxes. Invalid entries are dropped and logged."""
+    if not isinstance(raw, list):
+        logger.warning("Invalid details: expected list, got %s", type(raw).__name__)
+        return []
+
+    result: list[tuple[int, int, int, int, int, int, str]] = []
+    for entry in raw:
+        if not isinstance(entry, (list, tuple)):
+            logger.warning("Dropping detail entry: expected list/tuple, got %s", type(entry).__name__)
+            continue
+
+        if len(entry) == 4:
+            x, y, z, block = entry
+            x1 = x2 = x
+            y1 = y2 = y
+            z1 = z2 = z
+        elif len(entry) == 7:
+            x1, y1, z1, x2, y2, z2, block = entry
+        else:
+            logger.warning("Dropping detail entry: expected 4 or 7 elements, got %d", len(entry))
+            continue
+
+        coords = (x1, y1, z1, x2, y2, z2)
+        if any(isinstance(c, bool) or not isinstance(c, int) for c in coords):
+            logger.warning("Dropping detail entry: coordinates must be ints (no bools): %r", coords)
+            continue
+
+        if z1 < 0 or z2 < 0:
+            logger.warning("Dropping detail entry: z coordinates must be >= 0: z1=%r, z2=%r", z1, z2)
+            continue
+
+        if not isinstance(block, str):
+            logger.warning("Dropping detail entry: block must be a string, got %s", type(block).__name__)
+            continue
+
+        clean_block = re.sub(r"\s+", "", block)
+        if not DETAIL_RE.match(clean_block):
+            logger.warning("Dropping detail entry: block %r does not match DETAIL_RE", clean_block)
+            continue
+
+        if is_banned(clean_block):
+            logger.warning("Dropping detail entry: banned block %r", clean_block)
+            continue
+
+        sx1, sx2 = min(x1, x2), max(x1, x2)
+        sy1, sy2 = min(y1, y2), max(y1, y2)
+        sz1, sz2 = min(z1, z2), max(z1, z2)
+
+        volume = (sx2 - sx1 + 1) * (sy2 - sy1 + 1) * (sz2 - sz1 + 1)
+        if volume > 64:
+            logger.warning("Dropping detail entry: box volume %d exceeds 64 blocks", volume)
+            continue
+
+        result.append((sx1, sy1, sz1, sx2, sy2, sz2, clean_block))
+
+    return result
+
+
+def parse_reply(
+    raw_response: str,
+) -> tuple[str, dict[str, str], dict[str, dict[str, float]], list[tuple[int, int, int, int, int, int, str]]]:
     """Parses and validates the json and openscad code blocks from the LLM reply.
 
-    Returns (scad_text, blocks_dict).
+    Returns (scad_text, blocks_dict, mix_dict, details_list).
     """
     matches = FENCE_RE.findall(raw_response)
 
@@ -378,8 +508,8 @@ def parse_reply(raw_response: str) -> tuple[str, dict[str, str]]:
         raise LlmError("JSON must contain a 'blocks' object")
 
     raw_blocks = data["blocks"]
-    if not (1 <= len(raw_blocks) <= 12):
-        raise LlmError(f"Expected 1-12 parts, got {len(raw_blocks)}")
+    if not (1 <= len(raw_blocks) <= 16):
+        raise LlmError(f"Expected 1-16 parts, got {len(raw_blocks)}")
 
     blocks: dict[str, str] = {}
     for part, block_id in raw_blocks.items():
@@ -391,6 +521,9 @@ def parse_reply(raw_response: str) -> tuple[str, dict[str, str]]:
             )
         blocks[part] = block_id
 
+    mix = parse_mix(data.get("mix", {}))
+    details = parse_details(data.get("details", []))
+
     scad_text = scad_blocks[0].strip()
     if not scad_text:
         raise LlmError("OpenSCAD code block is empty")
@@ -399,17 +532,17 @@ def parse_reply(raw_response: str) -> tuple[str, dict[str, str]]:
         if part not in scad_text:
             raise LlmError(f"Part {part!r} does not appear in OpenSCAD code")
 
-    return scad_text, blocks
+    return scad_text, blocks, mix, details
 
 
 def design(
     description: str,
-    max_size: int,
+    limits: tuple[int, int, int] | int,
     image_png: bytes | None = None,
     on_text: Callable[[str], None] | None = None,
     provider: str = "claude",
-) -> tuple[str, dict[str, str], str]:
-    """Returns (scad_text, blocks, raw_response).
+) -> tuple[str, dict[str, str], dict[str, dict[str, float]], list[tuple[int, int, int, int, int, int, str]], str]:
+    """Returns (scad_text, blocks, mix, details, raw_response).
     blocks maps part name -> block id, in precedence order (later parts override earlier ones)."""
     if provider not in config.PROVIDERS:
         raise LlmError(f"Unknown provider: {provider!r}. Must be one of {config.PROVIDERS}")
@@ -418,7 +551,7 @@ def design(
         chunks: list[str] = []
         for chunk in _cli_text(
             description,
-            max_size,
+            limits,
             image_png=image_png,
             timeout=config.CLAUDE_TIMEOUT,
             provider=provider,
@@ -427,8 +560,8 @@ def design(
             if on_text:
                 on_text(chunk)
         raw_response = "".join(chunks)
-        scad_text, blocks = parse_reply(raw_response)
-        return scad_text, blocks, raw_response
+        scad_text, blocks, mix, details = parse_reply(raw_response)
+        return scad_text, blocks, mix, details, raw_response
     except LlmError:
         raise
     except Exception as exc:
