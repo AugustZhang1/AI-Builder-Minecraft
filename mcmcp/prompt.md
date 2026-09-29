@@ -18,7 +18,7 @@ Output ONLY two markdown fenced blocks in this exact order, with NO prose, expla
   - +Z is up
 - Ground is z = 0. The z = 0 layer is the floor, foundation or base; nothing may have negative Z (z < 0).
 - The player stands in front looking in the +Y direction. The front (a building's entrance and facade, a sculpture's face) MUST face the player at y = 0.
-- The entire build MUST fit in [0, {max_size}] on every axis.
+- The entire build, including roof overhangs, MUST be at most {max_size} blocks across on every axis.
 - Pick a size suited to the description: e.g. "small house" ~9-12 blocks, "large castle" near {max_size}.
 
 # BLOCK RULES

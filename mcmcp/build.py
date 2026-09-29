@@ -3,11 +3,16 @@
 Design axes: X = right, Y = away from the player (the front is at y=0), Z = up; 1 unit = 1 block.
 Minecraft: Y is up. Player yaw 0 = south (+Z), 90 = west, 180 = north, 270 / -90 = east.
 """
+import functools
+import hashlib
+import io
+import json
 from pathlib import Path
 import re
 import subprocess
 
 import numpy as np
+from PIL import Image
 import trimesh
 
 try:
@@ -327,3 +332,84 @@ def box_to_world(
         max(w1_y, w2_y),
         max(w1_z, w2_z),
     )
+
+
+@functools.cache
+def _block_colors() -> dict[str, list[int]]:
+    return json.loads(config.BLOCK_COLORS_FILE.read_text(encoding="utf-8"))
+
+
+def block_color(block_id: str) -> tuple[int, int, int]:
+    """Average texture colour of a block (block_colors.json); unknown ids get a stable made-up colour."""
+    rgb = _block_colors().get(block_id) or hashlib.md5(block_id.encode("utf-8")).digest()[:3]
+    return (int(rgb[0]), int(rgb[1]), int(rgb[2]))
+
+
+def _render_view(
+    grid: np.ndarray,
+    palette_rgb: np.ndarray,
+    proj_axis: int,
+    reverse_proj: bool = False,
+) -> np.ndarray:
+    """Renders a single orthographic view of shape (H, W, 3), one pixel per cell."""
+    v = np.moveaxis(grid, proj_axis, -1)
+    if reverse_proj:
+        v = v[:, :, ::-1]
+
+    D = v.shape[-1]
+    solid = v > 0
+    has_solid = np.any(solid, axis=-1)
+    first_idx = np.argmax(solid, axis=-1)
+    block_val = np.take_along_axis(v, first_idx[..., None], axis=-1).squeeze(-1)
+
+    depth = first_idx
+    shade = 1.0 - 0.6 * (depth.astype(np.float32) / max(D - 1, 1))
+
+    base_rgb = palette_rgb[block_val]
+    shaded_rgb = base_rgb * shade[..., None]
+    clipped_rgb = np.clip(np.round(shaded_rgb), 0, 255).astype(np.uint8)
+
+    bg_color = np.array([30, 30, 30], dtype=np.uint8)
+    view_rgb = np.where(has_solid[..., None], clipped_rgb, bg_color)
+
+    # Transpose (A, B) to (B, A) and flip rows so up in image is +z (for top: +y)
+    view_2d = np.transpose(view_rgb, (1, 0, 2))[::-1, :, :]
+
+    return view_2d
+
+
+def preview_png(grid: np.ndarray, palette: list[str]) -> bytes:
+    """Renders an RGB PNG with three orthographic views (FRONT, SIDE, TOP) side by side."""
+    if grid.ndim != 3:
+        raise ValueError(f"Expected 3D grid, got shape {grid.shape}")
+
+    palette_rgb = np.zeros((len(palette), 3), dtype=np.float32)
+    for i, block_id in enumerate(palette):
+        if i == 0 or block_id == "minecraft:air":
+            palette_rgb[i] = [30, 30, 30]
+        else:
+            palette_rgb[i] = block_color(block_id)
+
+    front_px = _render_view(grid, palette_rgb, proj_axis=1, reverse_proj=False)
+    side_px = _render_view(grid, palette_rgb, proj_axis=0, reverse_proj=True)
+    top_px = _render_view(grid, palette_rgb, proj_axis=2, reverse_proj=True)
+
+    cell = max(4, min(16, 400 // max(grid.shape)))  # px per block: small builds drawn bigger
+    views = [np.repeat(np.repeat(v, cell, axis=0), cell, axis=1) for v in (front_px, side_px, top_px)]
+    pad = 12
+    max_h = max(v.shape[0] for v in views)
+    canvas_h = max_h + 2 * pad
+    canvas_w = sum(v.shape[1] for v in views) + pad * (len(views) + 1)
+    canvas = np.full((canvas_h, canvas_w, 3), 30, dtype=np.uint8)
+
+    x = pad
+    for v in views:
+        h, w = v.shape[:2]
+        y = pad + (max_h - h) // 2
+        canvas[y : y + h, x : x + w] = v
+        x += w + pad
+
+    img = Image.fromarray(canvas, mode="RGB")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
