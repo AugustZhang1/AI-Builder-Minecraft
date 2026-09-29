@@ -18,16 +18,17 @@ import re
 import threading
 import time
 import urllib.request
+import zlib
 from typing import Any
 
 import numpy as np
 from PIL import Image
 
 try:
-    from . import build, config, llm, pixelart
+    from . import build, config, llm, pixelart, preview
     from .rcon import Rcon, RconError
 except ImportError:
-    from mcmcp import build, config, llm, pixelart
+    from mcmcp import build, config, llm, pixelart, preview
     from mcmcp.rcon import Rcon, RconError
 
 logger = logging.getLogger("mcmcp")
@@ -45,6 +46,8 @@ FRANK_RE = re.compile(r"\bfrank\b", re.IGNORECASE)
 NARRATION_RE = re.compile(r"^\s*//\s*>\s*(.+?)\s*$")
 
 PROVIDER_NAMES = {"claude": "Claude", "gemini": "Gemini"}
+
+LAST_DESIGNS: dict[str, tuple[np.ndarray, list[str], list[tuple[int, int, int, int, int, int, str]]]] = {}
 
 
 def get_provider() -> str:
@@ -85,6 +88,11 @@ def parse_ai_command(message: str) -> tuple[bool, str | None]:
 
     arg = msg[9:].strip()
     return True, arg if arg else None
+
+
+def parse_place_command(message: str) -> bool:
+    """Parses a message for the !place command (case-insensitive, exact, trimmed)."""
+    return message.strip().lower() == "!place"
 
 
 class Heartbeat:
@@ -327,28 +335,74 @@ def room_check_commands(
     return commands
 
 
-def find_free_size(
+def world_limits(origin_y: int, dim: str) -> tuple[int, int, int]:
+    """(wide, deep, tall) build limits from view distance and player feet height."""
+    reach = (config.view_distance() - 1) * 16 - config.GAP
+    wide = deep = reach
+    top = 319 if dim in ("minecraft:overworld", "overworld") else 255
+    tall = top - origin_y
+    if tall < 1:
+        raise ValueError("Too close to the top of the world.")
+    return (wide, deep, tall)
+
+
+def start_room_free(
     rcon: Rcon,
     origin: tuple[int, int, int],
     facing: str,
     dim: str,
-) -> int | None:
-    """Tests sizes in config.ROOM_SIZES (largest first). Returns first free S or None."""
-    for S in config.ROOM_SIZES:
-        box = (0, 0, 1, S - 1, S - 1, S - 1, 0)
-        x1, y1, z1, x2, y2, z2 = build.box_to_world(box, S, origin, facing, config.GAP)
+) -> bool:
+    """Quick free-space check before designing: tests one START_ROOM cube (z from 1)."""
+    S = config.START_ROOM
+    box = (0, 0, 1, S - 1, S - 1, S - 1, 0)
+    x1, y1, z1, x2, y2, z2 = build.box_to_world(box, S, origin, facing, config.GAP)
+    cmds = room_check_commands(dim, x1, y1, z1, x2, y2, z2)
+    if not cmds:
+        return False
+    for cmd in cmds:
+        reply = rcon.command(cmd)
+        if not reply.startswith("Test passed"):
+            return False
+    return True
+
+
+def room_boxes(
+    grid: np.ndarray,
+    dboxes: list[tuple[int, int, int, int, int, int, str]],
+) -> list[tuple[int, int, int, int, int, int, Any]]:
+    """Grid-space boxes for room check: solid mask with z=0 cleared plus detail boxes (z >= 1)."""
+    mask = (grid > 0).astype(np.uint8)
+    if mask.shape[2] > 0:
+        mask[:, :, 0] = 0
+    boxes = build.boxes(mask, 32768)
+    for db in dboxes:
+        x1, y1, z1, x2, y2, z2, _block = db
+        if z2 < 1:
+            continue
+        cz1 = max(1, z1)
+        boxes.append((x1, y1, cz1, x2, y2, z2, 1))
+    return boxes
+
+
+def check_room(
+    rcon: Rcon,
+    dim: str,
+    world_boxes: list[tuple[int, int, int, int, int, int]],
+) -> str:
+    """Checks if world boxes are free. Returns 'ok', 'blocked', or 'not_loaded'."""
+    for box in world_boxes:
+        x1, y1, z1, x2, y2, z2 = box
         cmds = room_check_commands(dim, x1, y1, z1, x2, y2, z2)
         if not cmds:
-            continue
-        free = True
+            return "blocked"
         for cmd in cmds:
             reply = rcon.command(cmd)
-            if not reply.startswith("Test passed"):
-                free = False
-                break
-        if free:
-            return S
-    return None
+            if reply.startswith("Test passed"):
+                continue
+            if "not loaded" in reply.lower():
+                return "not_loaded"
+            return "blocked"
+    return "ok"
 
 
 def check_grid_room(
@@ -466,6 +520,7 @@ def place_grid(
         vol = (bx2 - bx1 + 1) * (by2 - by1 + 1) * (bz2 - bz1 + 1)
         orig_block = palette[val]
         block_to_use = substitutions.get(orig_block, orig_block)
+        block_to_use = build.with_persistent_leaves(block_to_use)
 
         wx1, wy1, wz1, wx2, wy2, wz2 = build.box_to_world(b, sx, origin, facing, config.GAP)
         cmd = f"execute in {dim} run fill {wx1} {wy1} {wz1} {wx2} {wy2} {wz2} {block_to_use}"
@@ -506,13 +561,226 @@ def place_grid(
     return placed_blocks
 
 
+def place_details(
+    rcon: Rcon | None,
+    dboxes: list[tuple[int, int, int, int, int, int, str]],
+    size_x: int,
+    origin: tuple[int, int, int],
+    facing: str,
+    dim: str,
+) -> int:
+    """Places detail boxes in list order via RCON fill commands with rotated states."""
+    placed = 0
+    for db in dboxes:
+        if STOP.is_set():
+            break
+        gx1, gy1, gz1, gx2, gy2, gz2, block = db
+        vol = (abs(gx2 - gx1) + 1) * (abs(gy2 - gy1) + 1) * (abs(gz2 - gz1) + 1)
+        rotated_block = build.rotate_state(block, facing)
+        wx1, wy1, wz1, wx2, wy2, wz2 = build.box_to_world(
+            (gx1, gy1, gz1, gx2, gy2, gz2, 0), size_x, origin, facing, config.GAP
+        )
+        cmd = f"execute in {dim} run fill {wx1} {wy1} {wz1} {wx2} {wy2} {wz2} {rotated_block}"
+        reply = rcon.command(cmd) if rcon else "Successfully filled"
+
+        if reply.startswith("Successfully filled") or reply.startswith("No blocks were filled"):
+            placed += vol
+        elif "not loaded" in reply.lower():
+            raise PlacementError(
+                f"Stopped after {placed:,} blocks: the build area is no longer loaded. Stay close to it."
+            )
+        else:
+            logger.warning(
+                "Detail block %r rejected by server (%s). Skipped.",
+                rotated_block,
+                reply.strip(),
+            )
+
+        delay = max(config.MIN_COMMAND_DELAY, vol / config.BLOCKS_PER_SECOND)
+        if STOP.wait(delay):
+            break
+
+    return placed
+
+
+def load_blocks_data(
+    data: Any,
+) -> tuple[dict[str, str], dict[str, dict[str, float]], list[tuple[int, int, int, int, int, int, str]]]:
+    """Load (blocks, mix, details) from loaded JSON data."""
+    if isinstance(data, dict) and "blocks" in data:
+        blocks = data["blocks"]
+        mix = llm.parse_mix(data.get("mix", {}))
+        details = llm.parse_details(data.get("details", []))
+        return blocks, mix, details
+    elif isinstance(data, dict):
+        return data, {}, []
+    return {}, {}, []
+
+
+def detail_block_count(dboxes: list[tuple[int, int, int, int, int, int, str]]) -> int:
+    return sum((x2 - x1 + 1) * (y2 - y1 + 1) * (z2 - z1 + 1) for x1, y1, z1, x2, y2, z2, _ in dboxes)
+
+
+def voxelize_design(
+    scad: str,
+    stls: dict[str, Path],
+    blocks: dict[str, str],
+    mix: dict[str, dict[str, float]],
+    details: list[tuple[int, int, int, int, int, int, str]],
+    limits: tuple[int, int, int],
+    build_dir: Path,
+) -> tuple[np.ndarray, list[str], list[tuple[int, int, int, int, int, int, str]], bool]:
+    """Voxelize, apply texture mixes, map details and save the previews.
+    Returns (grid, palette, dboxes, details_skipped); details are skipped if the design was scaled down."""
+    grid, palette, offset, scale = build.voxelize(stls, blocks, limits)
+    if mix:
+        grid, palette = build.apply_mix(grid, palette, mix, zlib.crc32(scad.encode("utf-8")))
+    skipped = scale < 1.0 and bool(details)
+    dboxes = [] if skipped else build.detail_boxes(details, offset, grid.shape)
+
+    # Previews never fail a build.
+    for name, make in (
+        ("preview.png", lambda: (build_dir / "preview.png").write_bytes(
+            preview.blocks_png(*build.stamp_details(grid, palette, dboxes)))),
+        ("mesh.png", lambda: (build_dir / "mesh.png").write_bytes(preview.mesh_png(stls, blocks))),
+        ("mesh.glb", lambda: preview.export_glb(stls, blocks, build_dir / "mesh.glb")),
+    ):
+        try:
+            make()
+        except Exception as e:
+            logger.warning("Failed to write %s: %s", name, e)
+    return grid, palette, dboxes, skipped
+
+
+def place_design(
+    rcon: Rcon,
+    player: str,
+    design: tuple[np.ndarray, list[str], list[tuple[int, int, int, int, int, int, str]]],
+    origin: tuple[int, int, int],
+    facing: str,
+    dim: str,
+    start_time: float,
+) -> None:
+    """Room check, placing and completion messages shared by run_build and run_place."""
+    grid, palette, dboxes = design
+
+    # 1. Room check on the real design
+    rboxes = room_boxes(grid, dboxes)
+    world_boxes = [build.box_to_world(b, grid.shape[0], origin, facing, config.GAP) for b in rboxes]
+    status = check_room(rcon, dim, world_boxes)
+    if status == "not_loaded":
+        send_message(
+            rcon,
+            player,
+            "Part of the build is too far away to load. Stand nearer the middle of the area, or raise your render distance, then type !place.",
+        )
+        return
+    elif status == "blocked":
+        X, Y, Z = grid.shape
+        send_message(
+            rcon,
+            player,
+            f"The design ({X}x{Y}x{Z}) is blocked here. Move to open ground and type !place.",
+        )
+        return
+
+    # 2. Placing blocks announcement
+    main_count = int(np.count_nonzero(grid))
+    total_blocks = main_count + detail_block_count(dboxes)
+    send_message(rcon, player, f"Placing {total_blocks:,} blocks...")
+
+    # 3. Placing main grid
+    placed_main = place_grid(
+        rcon,
+        player,
+        grid,
+        palette,
+        origin,
+        facing,
+        dim,
+        lambda msg: send_message(rcon, player, msg),
+    )
+
+    # 4. Placing details
+    placed_details = 0
+    if not STOP.is_set() and dboxes:
+        placed_details = place_details(
+            rcon,
+            dboxes,
+            grid.shape[0],
+            origin,
+            facing,
+            dim,
+        )
+
+    placed_total = placed_main + placed_details
+
+    # 5. Finished
+    if STOP.is_set():
+        send_message(rcon, player, f"Stopped after {placed_total} blocks.")
+    else:
+        elapsed = int(time.time() - start_time)
+        mins = elapsed // 60
+        secs = elapsed % 60
+        send_message(rcon, player, f"Done: {total_blocks} blocks in {mins}m {secs}s.")
+
+
+def run_place(rcon: Rcon, player: str) -> None:
+    """Places the player's last voxelized design at their current position and facing."""
+    STOP.clear()
+    start_time = time.time()
+    try:
+        saved = LAST_DESIGNS.get(player.strip().lower())
+        if saved is None:
+            send_message(rcon, player, "No saved design. Use !design first.")
+            return
+
+        pos_reply = rcon.command(f"data get entity {player} Pos")
+        rot_reply = rcon.command(f"data get entity {player} Rotation")
+        dim_reply = rcon.command(f"data get entity {player} Dimension")
+
+        pos = parse_pos_reply(pos_reply)
+        rot = parse_rotation_reply(rot_reply)
+        dim = parse_dimension_reply(dim_reply)
+
+        origin = (math.floor(pos[0]), math.floor(pos[1]), math.floor(pos[2]))
+        facing = build.facing_from_yaw(rot[0])
+
+        try:
+            limits = world_limits(origin[1], dim)
+        except ValueError as e:
+            send_message(rcon, player, str(e))
+            return
+
+        w, d, t = limits
+        grid, palette, dboxes = saved
+        X, Y, Z = grid.shape
+        if X > w or Y > d or Z > t:
+            send_message(
+                rcon,
+                player,
+                f"The design ({X}x{Y}x{Z}) does not fit here (limits {w}x{d}x{t}).",
+            )
+            return
+
+        place_design(rcon, player, saved, origin, facing, dim, start_time)
+
+    except Exception as e:
+        logger.exception("Place failed for player %s: %s", player, e)
+        err_str = str(e).strip()
+        reason = err_str.splitlines()[0] if err_str else type(e).__name__
+        if len(reason) > 100:
+            reason = reason[:97] + "..."
+        send_message(rcon, player, f"Build failed: {reason}")
+
+
 def run_build(
     rcon: Rcon,
     player: str,
     description: str,
     image_url: str | None = None,
     scad_override: str | None = None,
-    blocks_override: dict[str, str] | None = None,
+    blocks_override: Any = None,
     ai: str | None = None,
 ) -> None:
     """Executes the full in-game design and build pipeline."""
@@ -531,9 +799,16 @@ def run_build(
         origin = (math.floor(pos[0]), math.floor(pos[1]), math.floor(pos[2]))
         facing = build.facing_from_yaw(rot[0])
 
-        # 2. Room check before calling Claude
-        S = find_free_size(rcon, origin, facing, dim)
-        if S is None:
+        # 2. World limits
+        try:
+            limits = world_limits(origin[1], dim)
+        except ValueError as e:
+            send_message(rcon, player, str(e))
+            return
+        w, d, t = limits
+
+        # 3. Room check before calling Claude
+        if not start_room_free(rcon, origin, facing, dim):
             send_message(
                 rcon,
                 player,
@@ -541,13 +816,13 @@ def run_build(
             )
             return
 
-        # 3. Designing announcement and image download
+        # 4. Designing announcement and image download
         provider = (ai.lower() if ai else None) or get_provider()
         provider_name = PROVIDER_NAMES.get(provider, provider.capitalize())
         send_message(
             rcon,
             player,
-            f"Designing with {provider_name} (up to {S} blocks). This takes a few minutes...",
+            f"Designing with {provider_name} (up to {w}x{d}x{t}). This takes a few minutes...",
         )
         image_png: bytes | None = None
         if image_url:
@@ -558,10 +833,10 @@ def run_build(
                 send_message(rcon, player, "Couldn't load that image.")
                 return
 
-        # 4. LLM design or override
+        # 5. LLM design or override
         if scad_override is not None and blocks_override is not None:
             scad = scad_override
-            blocks = blocks_override
+            blocks, mix, details = load_blocks_data(blocks_override)
             raw = "// OpenSCAD design and blocks provided via flags\n"
         else:
             send_fn = lambda msg: send_message(rcon, player, msg)
@@ -569,9 +844,9 @@ def run_build(
             narrator = Narrator(send_fn, on_first=heartbeat.stop)
             heartbeat.start()
             try:
-                scad, blocks, raw = llm.design(
+                scad, blocks, mix, details, raw = llm.design(
                     description,
-                    S,
+                    limits,
                     image_png=image_png,
                     on_text=narrator.feed,
                     provider=provider,
@@ -585,60 +860,28 @@ def run_build(
         build_dir.mkdir(parents=True, exist_ok=True)
 
         (build_dir / "request.txt").write_text(
-            f"Player: {player}\nProvider: {provider}\nSize: {S}\nImage: {image_url or ''}\nDescription: {description}\n",
+            f"Player: {player}\nProvider: {provider}\nLimits: {w}x{d}x{t}\nImage: {image_url or ''}\nDescription: {description}\n",
             encoding="utf-8",
         )
         (build_dir / "response.txt").write_text(raw, encoding="utf-8")
         (build_dir / "design.scad").write_text(scad, encoding="utf-8")
-        (build_dir / "blocks.json").write_text(json.dumps(blocks, indent=2), encoding="utf-8")
-
-        # 5. Rendering and voxelizing
-        send_message(rcon, player, "Rendering...")
-        stls = build.render_parts(scad, list(blocks), build_dir)
-        # 6. Build at the design's own size if that space is free. Shrinking to S can erase
-        #    1-block walls, so only shrink when the full size doesn't fit here.
-        grid, palette = build.voxelize(stls, blocks, config.MAX_SIZE)
-        fits = check_grid_room(rcon, origin, facing, dim, grid.shape)
-        if not fits and max(grid.shape) > S:
-            grid, palette = build.voxelize(stls, blocks, S)
-            fits = check_grid_room(rcon, origin, facing, dim, grid.shape)
-            if fits:
-                send_message(rcon, player, "Shrunk the design to fit the space; thin details may be lost.")
-        (build_dir / "preview.png").write_bytes(build.preview_png(grid, palette))
-        solid_count = int(np.count_nonzero(grid))
-        if solid_count > config.MAX_BLOCKS:
-            send_message(
-                rcon,
-                player,
-                f"Design has too many blocks ({solid_count:,} > {config.MAX_BLOCKS:,}). Refused.",
-            )
-            return
-
-        if not fits:
-            send_message(rcon, player, "Something moved into the build area. Cancelled.")
-            return
-
-        # 7. Placing blocks
-        send_message(rcon, player, f"Placing {solid_count} blocks...")
-        placed = place_grid(
-            rcon,
-            player,
-            grid,
-            palette,
-            origin,
-            facing,
-            dim,
-            lambda msg: send_message(rcon, player, msg),
+        (build_dir / "blocks.json").write_text(
+            json.dumps({"blocks": blocks, "mix": mix, "details": details}, indent=2),
+            encoding="utf-8",
         )
 
-        # 8. Finished
-        if STOP.is_set():
-            send_message(rcon, player, f"Stopped after {placed} blocks.")
-        else:
-            elapsed = int(time.time() - start_time)
-            mins = elapsed // 60
-            secs = elapsed % 60
-            send_message(rcon, player, f"Done: {solid_count} blocks in {mins}m {secs}s.")
+        # 6. Rendering and voxelizing once with world limits
+        send_message(rcon, player, "Rendering...")
+        stls = build.render_parts(scad, list(blocks), build_dir)
+        grid, palette, dboxes, skipped = voxelize_design(scad, stls, blocks, mix, details, limits, build_dir)
+        if skipped:
+            send_message(rcon, player, "Scaled the design down to fit; skipped the detail blocks.")
+
+        # 7. Keep it for !place, then check the room and place
+        design_tuple = (grid, palette, dboxes)
+        LAST_DESIGNS[player.strip().lower()] = design_tuple
+
+        place_design(rcon, player, design_tuple, origin, facing, dim, start_time)
 
     except Exception as e:
         logger.exception("Build failed for player %s: %s", player, e)
@@ -652,13 +895,18 @@ def run_build(
 def run_offline_build(
     description: str,
     image_url: str | None = None,
-    size: int = 32,
+    size: int | None = None,
     scad_file: str | None = None,
     blocks_file: str | None = None,
     ai: str | None = None,
 ) -> None:
-    """Executes design, rendering, and voxelization without RCON, printing results and timings."""
+    """Executes design, rendering, voxelization, and previews without RCON, printing results and timings."""
     t_total_start = time.time()
+    reach = (config.view_distance() - 1) * 16 - config.GAP
+    if size is None:
+        size = reach
+    limits = (size, size, size)
+
     image_png: bytes | None = None
     if image_url:
         image_png = load_image_png(image_url)
@@ -667,13 +915,14 @@ def run_offline_build(
     if scad_file and blocks_file:
         scad = Path(scad_file).read_text(encoding="utf-8")
         blocks_data = json.loads(Path(blocks_file).read_text(encoding="utf-8"))
-        blocks = blocks_data["blocks"] if isinstance(blocks_data, dict) and "blocks" in blocks_data else blocks_data
+        blocks, mix, details = load_blocks_data(blocks_data)
+        raw = ""
         t_design = 0.0
     else:
         t0 = time.time()
-        scad, blocks, _raw = llm.design(
+        scad, blocks, mix, details, raw = llm.design(
             description,
-            size,
+            limits,
             image_png=image_png,
             provider=provider,
         )
@@ -681,31 +930,33 @@ def run_offline_build(
 
     build_dir = config.WORK_DIR / f"offline-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     build_dir.mkdir(parents=True, exist_ok=True)
-    (build_dir / "blocks.json").write_text(json.dumps(blocks, indent=2), encoding="utf-8")
+    (build_dir / "blocks.json").write_text(
+        json.dumps({"blocks": blocks, "mix": mix, "details": details}, indent=2),
+        encoding="utf-8",
+    )
+    if raw:
+        (build_dir / "response.txt").write_text(raw, encoding="utf-8")
 
     t0 = time.time()
     stls = build.render_parts(scad, list(blocks), build_dir)
     t_render = time.time() - t0
 
     t0 = time.time()
-    grid, palette = build.voxelize(stls, blocks, size)
+    grid, palette, dboxes, skipped = voxelize_design(scad, stls, blocks, mix, details, limits, build_dir)
     t_vox = time.time() - t0
 
-    preview_path = build_dir / "preview.png"
-    preview_path.write_bytes(build.preview_png(grid, palette))
-
     t_total = time.time() - t_total_start
-    solid_count = int(np.count_nonzero(grid))
+    total_blocks = int(np.count_nonzero(grid)) + detail_block_count(dboxes)
 
-    print(f"Block count: {solid_count}")
+    print(f"Block count: {total_blocks}")
+    print(f"Detail boxes: {len(dboxes)}" + (" (skipped: design was scaled down)" if skipped else ""))
     print(f"Grid size: {grid.shape}")
-    print(f"Palette: {palette}")
-    print(f"Preview: {preview_path}")
+    print(f"Previews: preview.png, mesh.png, mesh.glb")
     print(f"Folder: {build_dir}")
     print("Timings:")
     print(f"  Design:   {t_design:.2f}s")
     print(f"  Render:   {t_render:.2f}s")
-    print(f"  Voxelize: {t_vox:.2f}s")
+    print(f"  Voxelize + previews: {t_vox:.2f}s")
     print(f"  Total:    {t_total:.2f}s")
 
 
@@ -1039,6 +1290,35 @@ def handle_chat_line(
         t.start()
         return
 
+    if parse_place_command(message):
+        if not is_op(player, config.OPS_FILE):
+            send_message(rcon, player, "Only ops can use !place.")
+            return
+
+        saved = LAST_DESIGNS.get(player.strip().lower())
+        if saved is None:
+            send_message(rcon, player, "No saved design. Use !design first.")
+            return
+
+        if build_lock is not None and not build_lock.acquire(blocking=False):
+            send_message(
+                rcon,
+                player,
+                "A build is already running. Try again when it finishes.",
+            )
+            return
+
+        def place_worker():
+            try:
+                run_place(rcon, player)
+            finally:
+                if build_lock is not None:
+                    build_lock.release()
+
+        t = threading.Thread(target=place_worker, daemon=True)
+        t.start()
+        return
+
     is_cmd, desc, img_url = parse_command(message)
     if not is_cmd:
         return
@@ -1081,11 +1361,12 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+    default_reach = (config.view_distance() - 1) * 16 - config.GAP
     parser = argparse.ArgumentParser(description="Minecraft MCP v2 builder")
     parser.add_argument("--once", type=str, default=None, help="Run one build and exit")
     parser.add_argument("--player", type=str, default=None, help="Player name for position and messages")
     parser.add_argument("--image", type=str, default=None, help="Image URL or local file path")
-    parser.add_argument("--size", type=int, default=32, help="Max size when no --player (default 32)")
+    parser.add_argument("--size", type=int, default=default_reach, help=f"Max size when no --player (default {default_reach})")
     parser.add_argument("--scad", type=str, default=None, help="OpenSCAD file to use (skip Claude)")
     parser.add_argument("--blocks", type=str, default=None, help="Blocks JSON file to use (skip Claude)")
     parser.add_argument(
@@ -1118,8 +1399,7 @@ def main() -> None:
             scad_override = Path(args.scad).read_text(encoding="utf-8") if args.scad else None
             blocks_override = None
             if args.blocks:
-                raw_b = json.loads(Path(args.blocks).read_text(encoding="utf-8"))
-                blocks_override = raw_b["blocks"] if isinstance(raw_b, dict) and "blocks" in raw_b else raw_b
+                blocks_override = json.loads(Path(args.blocks).read_text(encoding="utf-8"))
 
             run_build(
                 rcon,

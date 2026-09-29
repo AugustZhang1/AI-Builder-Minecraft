@@ -33,9 +33,7 @@ SETTINGS_FILE = WORK_DIR / "settings.json"  # {"provider": "claude" | "gemini"},
 HEARTBEAT_SECONDS = 30
 
 # Build limits.
-MAX_SIZE = 64                      # blocks per axis
-ROOM_SIZES = (64, 48, 32, 24, 16)  # free-space sizes tried, largest first
-MAX_BLOCKS = 200_000               # solid blocks per build
+START_ROOM = 16                    # the quick free-space check before designing
 GAP = 3                            # blocks between the player and the build's front
 FALLBACK_BLOCK = "minecraft:stone"
 # Never placed; swapped for FALLBACK_BLOCK. Fluids and fire, TNT, falling blocks (plus every
