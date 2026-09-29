@@ -24,13 +24,20 @@ import numpy as np
 from PIL import Image
 
 try:
-    from . import build, config, llm
+    from . import animate, build, config, llm, pixelart
     from .rcon import Rcon, RconError
 except ImportError:
-    from mcmcp import build, config, llm
+    from mcmcp import animate, build, config, llm, pixelart
     from mcmcp.rcon import Rcon, RconError
 
 logger = logging.getLogger("mcmcp")
+
+STOP = threading.Event()
+
+
+class PlacementError(Exception):
+    pass
+
 
 CHAT_RE = re.compile(r"\]: (?:\[Not Secure\] )?<([A-Za-z0-9_]{3,16})> (.*)$")
 URL_RE = re.compile(r"https?://\S+")
@@ -39,45 +46,72 @@ NARRATION_RE = re.compile(r"^\s*//\s*>\s*(.+?)\s*$")
 
 PROVIDER_NAMES = {"claude": "Claude", "gemini": "Gemini"}
 
+HELP_LINES = (
+    "Commands (ops only):",
+    "!design <description> - the AI designs it and builds it in front of you",
+    "!design <image link> <description> - the same, using the picture as a reference",
+    "!pixelart <image link> [width] - builds the picture as a flat wall (no AI)",
+    "!designstop - stops the build that is running",
+    "!designai [claude|gemini] - shows or switches the AI",
+    "!designanim [on|off] - shows or switches the builder crew animation",
+    "!designhelp - shows this list",
+)
+
+
+def load_settings() -> dict[str, Any]:
+    """Reads config.SETTINGS_FILE ({"provider": ..., "animate": ...}); missing or invalid -> {}."""
+    try:
+        data = json.loads(config.SETTINGS_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_setting(key: str, value: Any) -> None:
+    """Sets one key in config.SETTINGS_FILE, keeping the others."""
+    data = load_settings()
+    data[key] = value
+    config.SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    config.SETTINGS_FILE.write_text(json.dumps(data), encoding="utf-8")
+
 
 def get_provider() -> str:
-    """Returns the configured AI provider ('claude' or 'gemini').
-
-    Reads config.SETTINGS_FILE. Missing/invalid file or unknown value -> 'claude'.
-    """
-    try:
-        if not config.SETTINGS_FILE.exists():
-            return "claude"
-        data = json.loads(config.SETTINGS_FILE.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            provider = data.get("provider")
-            if isinstance(provider, str) and provider.lower() in PROVIDER_NAMES:
-                return provider.lower()
-    except Exception:
-        pass
+    """Returns the configured AI provider ('claude' or 'gemini'); unknown or missing -> 'claude'."""
+    provider = load_settings().get("provider")
+    if isinstance(provider, str) and provider.lower() in PROVIDER_NAMES:
+        return provider.lower()
     return "claude"
 
 
 def set_provider(name: str) -> None:
     """Sets the AI provider in config.SETTINGS_FILE."""
-    config.SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    config.SETTINGS_FILE.write_text(
-        json.dumps({"provider": name}),
-        encoding="utf-8",
-    )
+    save_setting("provider", name)
+
+
+def get_animate() -> bool:
+    """Whether !design uses the builder crew animation (set with !designanim; default config.ANIMATE)."""
+    value = load_settings().get("animate")
+    return value if isinstance(value, bool) else config.ANIMATE
+
+
+def _parse_word_command(message: str, word: str) -> tuple[bool, str | None]:
+    """Parses `word [arg]` (case-insensitive). Returns (is_command, arg_or_None)."""
+    msg = message.strip()
+    n = len(word)
+    if not (msg.lower().startswith(word) and (len(msg) == n or msg[n].isspace())):
+        return False, None
+    arg = msg[n:].strip()
+    return True, arg if arg else None
 
 
 def parse_ai_command(message: str) -> tuple[bool, str | None]:
-    """Parses a message for the !designai command.
+    """Parses a message for the !designai command. Returns (is_command, arg_or_None)."""
+    return _parse_word_command(message, "!designai")
 
-    Returns (is_command, arg_or_None).
-    """
-    msg = message.strip()
-    if not (msg.lower().startswith("!designai") and (len(msg) == 9 or msg[9].isspace())):
-        return False, None
 
-    arg = msg[9:].strip()
-    return True, arg if arg else None
+def parse_anim_command(message: str) -> tuple[bool, str | None]:
+    """Parses a message for the !designanim command. Returns (is_command, arg_or_None)."""
+    return _parse_word_command(message, "!designanim")
 
 
 class Heartbeat:
@@ -168,13 +202,19 @@ def sanitize_frank(text: str) -> str:
     return FRANK_RE.sub("Fr*nk", text)
 
 
-def send_message(rcon: Rcon | None, player: str | None, msg: str) -> None:
+def send_message(
+    rcon: Rcon | None,
+    player: str | None,
+    msg: str,
+    prefix: str = "[design]",
+) -> None:
     """Sends a gold tellraw message to the player, sanitizing 'frank'."""
     safe_msg = sanitize_frank(msg)
+    full_text = f"{prefix} {safe_msg}" if prefix else safe_msg
     if not rcon or not player:
-        logger.info("[tellraw -> %s] %s", player or "<no-player>", safe_msg)
+        logger.info("[tellraw -> %s] %s", player or "<no-player>", full_text)
         return
-    payload = json.dumps({"text": "[design] " + safe_msg, "color": "gold"})
+    payload = json.dumps({"text": full_text, "color": "gold"})
     cmd = f"tellraw {player} {payload}"
     try:
         rcon.command(cmd)
@@ -282,26 +322,28 @@ def room_check_commands(
     """Generates read-only 'execute if blocks' commands to verify the area is free.
 
     Compares against an all-air reference region at the top of the world.
-    Returns an empty list if the box overlaps the reference region.
+    Walks up from min_y in slabs ensuring no slab overlaps its reference.
+    Returns an empty list if any slab cannot be checked (e.g. reaches the top).
     """
     min_x, max_x = min(x1, x2), max(x1, x2)
     min_y, max_y = min(y1, y2), max(y1, y2)
     min_z, max_z = min(z1, z2), max(z1, z2)
 
     top = 319 if dim in ("minecraft:overworld", "overworld") else 255
-    if max_y > top - (max_y - min_y) - 1:
-        return []
 
     layer_area = (max_x - min_x + 1) * (max_z - min_z + 1)
     if layer_area <= 0:
         return []
 
-    max_layers = max(1, 32768 // layer_area)
     commands: list[str] = []
     cur_y = min_y
     while cur_y <= max_y:
-        slab_y2 = min(max_y, cur_y + max_layers - 1)
-        ry = top - (slab_y2 - cur_y)
+        h = min(32768 // layer_area, (top - cur_y + 1) // 2)
+        if h < 1:
+            return []
+        slab_y2 = min(max_y, cur_y + h - 1)
+        h_prime = slab_y2 - cur_y + 1
+        ry = top - h_prime + 1
         cmd = (
             f"execute in {dim} if blocks {min_x} {cur_y} {min_z} {max_x} {slab_y2} {max_z} "
             f"{min_x} {ry} {min_z} all"
@@ -342,10 +384,12 @@ def check_grid_room(
     facing: str,
     dim: str,
     grid_shape: tuple[int, int, int],
+    grow: int = 0,
 ) -> bool:
-    """Verifies that the final voxelized grid bounding box is free of blocks."""
+    """Verifies that the final voxelized grid bounding box, grown by `grow` blocks on each
+    side (not up or down), is free of blocks."""
     sx, sy, sz = grid_shape
-    real_box = (0, 0, 1, sx - 1, sy - 1, sz - 1, 0)
+    real_box = (-grow, -grow, 1, sx - 1 + grow, sy - 1 + grow, sz - 1, 0)
     x1, y1, z1, x2, y2, z2 = build.box_to_world(real_box, sx, origin, facing, config.GAP)
     cmds = room_check_commands(dim, x1, y1, z1, x2, y2, z2)
     if not cmds:
@@ -357,35 +401,148 @@ def check_grid_room(
     return True
 
 
-def load_image_png(source: str) -> bytes:
-    """Downloads or reads an image, converts to RGB, thumbnails, and encodes to PNG bytes."""
+def download_image(source: str) -> bytes:
+    """Downloads or reads an image into raw bytes (URL or local path)."""
     path = Path(source)
     if path.is_file():
         data = path.read_bytes()
         if len(data) > config.IMAGE_MAX_BYTES:
             raise ValueError(f"Image exceeds maximum size ({len(data)} > {config.IMAGE_MAX_BYTES})")
-    else:
-        req = urllib.request.Request(
-            source,
-            headers={"User-Agent": "mcmcp/1.0 (Minecraft MCP Builder)"},
-        )
-        with urllib.request.urlopen(req, timeout=20.0) as resp:
-            data_arr = bytearray()
-            while True:
-                chunk = resp.read(65536)
-                if not chunk:
-                    break
-                data_arr.extend(chunk)
-                if len(data_arr) > config.IMAGE_MAX_BYTES:
-                    raise ValueError(f"Image exceeds maximum size of {config.IMAGE_MAX_BYTES} bytes")
-            data = bytes(data_arr)
+        return data
 
+    req = urllib.request.Request(
+        source,
+        headers={"User-Agent": "mcmcp/1.0 (Minecraft MCP Builder)"},
+    )
+    with urllib.request.urlopen(req, timeout=20.0) as resp:
+        data_arr = bytearray()
+        while True:
+            chunk = resp.read(65536)
+            if not chunk:
+                break
+            data_arr.extend(chunk)
+            if len(data_arr) > config.IMAGE_MAX_BYTES:
+                raise ValueError(f"Image exceeds maximum size of {config.IMAGE_MAX_BYTES} bytes")
+        return bytes(data_arr)
+
+
+def load_image_png(source: str) -> bytes:
+    """Downloads or reads an image, converts to RGB, thumbnails, and encodes to PNG bytes."""
+    data = download_image(source)
     with Image.open(io.BytesIO(data)) as img:
         img = img.convert("RGB")
         img.thumbnail((config.IMAGE_MAX_SIDE, config.IMAGE_MAX_SIDE))
         out = io.BytesIO()
         img.save(out, format="PNG")
         return out.getvalue()
+
+
+def estimate_seconds(fill_boxes: list[build.Box]) -> float:
+    """Sum of per-command delays for placement boxes."""
+    total = 0.0
+    for b in fill_boxes:
+        bx1, by1, bz1, bx2, by2, bz2, _ = b
+        vol = (bx2 - bx1 + 1) * (by2 - by1 + 1) * (bz2 - bz1 + 1)
+        total += max(config.MIN_COMMAND_DELAY, vol / config.BLOCKS_PER_SECOND)
+    return total
+
+
+def format_estimate(val: float | list[build.Box]) -> str:
+    """Format seconds as 'about N minutes' (>= 90 s) or 'about N seconds'."""
+    if isinstance(val, list):
+        seconds = estimate_seconds(val)
+    else:
+        seconds = float(val)
+    if seconds >= 90:
+        mins = round(seconds / 60)
+        return f"about {mins} minutes"
+    s = round(seconds)
+    return f"about {s} seconds"
+
+
+def place_grid(
+    rcon: Rcon | None,
+    player: str | None,
+    grid: np.ndarray,
+    palette: list[str],
+    origin: tuple[int, int, int],
+    facing: str,
+    dim: str,
+    send: Callable[[str], Any],
+    driver: Callable[[list[build.Box], Callable[[build.Box], int]], Any] | None = None,
+) -> int:
+    """Places a voxelized grid into the world via RCON /fill commands.
+    With a driver (the build animation), driver(boxes, place_one) decides the order and the
+    pace; place_one(box) places one box and returns its block count."""
+    solid_count = int(np.count_nonzero(grid))
+    if solid_count == 0:
+        return 0
+
+    sx = grid.shape[0]
+    fill_boxes = build.boxes(grid, config.FILL_MAX_VOLUME)
+    substitutions: dict[str, str] = {
+        b: config.FALLBACK_BLOCK
+        for b in palette[1:]
+        if b in config.BANNED_BLOCKS or b.endswith("_concrete_powder")
+    }
+    if substitutions:
+        logger.warning("Banned blocks replaced with %s: %s", config.FALLBACK_BLOCK, sorted(substitutions))
+    placed_blocks = 0
+    announced_milestones: set[int] = set()
+
+    def place_one(b: build.Box) -> int:
+        nonlocal placed_blocks
+        bx1, by1, bz1, bx2, by2, bz2, val = b
+        vol = (bx2 - bx1 + 1) * (by2 - by1 + 1) * (bz2 - bz1 + 1)
+        orig_block = palette[val]
+        block_to_use = substitutions.get(orig_block, orig_block)
+
+        wx1, wy1, wz1, wx2, wy2, wz2 = build.box_to_world(b, sx, origin, facing, config.GAP)
+        cmd = f"execute in {dim} run fill {wx1} {wy1} {wz1} {wx2} {wy2} {wz2} {block_to_use}"
+        reply = rcon.command(cmd) if rcon else "Successfully filled"
+
+        if reply.startswith("Successfully filled") or reply.startswith("No blocks were filled"):
+            pass
+        elif "not loaded" in reply.lower():
+            raise PlacementError(
+                f"Stopped after {placed_blocks:,} blocks: the build area is no longer loaded. Stay close to it."
+            )
+        else:
+            logger.warning(
+                "Block %r rejected by server (%s). Substituting %s",
+                block_to_use,
+                reply.strip(),
+                config.FALLBACK_BLOCK,
+            )
+            substitutions[orig_block] = config.FALLBACK_BLOCK
+            retry_cmd = (
+                f"execute in {dim} run fill {wx1} {wy1} {wz1} {wx2} {wy2} {wz2} "
+                f"{config.FALLBACK_BLOCK}"
+            )
+            if rcon:
+                rcon.command(retry_cmd)
+
+        placed_blocks += vol
+        pct = int((placed_blocks * 100) / solid_count)
+        for m in (25, 50, 75):
+            if pct >= m and m not in announced_milestones:
+                announced_milestones.add(m)
+                send(f"Placing blocks... {m}%")
+        return vol
+
+    if driver is not None:
+        driver(fill_boxes, place_one)
+        return placed_blocks
+
+    for b in fill_boxes:
+        if STOP.is_set():
+            break
+        vol = place_one(b)
+        delay = max(config.MIN_COMMAND_DELAY, vol / config.BLOCKS_PER_SECOND)
+        if STOP.wait(delay):
+            break
+
+    return placed_blocks
 
 
 def run_build(
@@ -398,7 +555,11 @@ def run_build(
     ai: str | None = None,
 ) -> None:
     """Executes the full in-game design and build pipeline."""
+    STOP.clear()
     start_time = time.time()
+    crew: animate.Crew | None = None
+    survey: animate.Survey | None = None
+    scaffold: animate.Scaffold | None = None
     try:
         # 1. Player info via RCON
         pos_reply = rcon.command(f"data get entity {player} Pos")
@@ -421,6 +582,14 @@ def run_build(
                 "Not enough room here. Stand on open, flat ground and try again.",
             )
             return
+
+        # Animation: builders stand at the plot and its corners are marked while the AI designs
+        if get_animate():
+            rcon.command(animate.kill_crew_command())
+            crew = animate.Crew(rcon, dim, player, origin, facing, config.CREW_SIZE)
+            crew.summon(S)
+            survey = animate.Survey(rcon, animate.corner_particle_commands(dim, origin, facing, S))
+            survey.start()
 
         # 3. Designing announcement and image download
         provider = (ai.lower() if ai else None) or get_provider()
@@ -460,6 +629,8 @@ def run_build(
             finally:
                 heartbeat.stop()
             narrator.flush()
+        if survey is not None:
+            survey.stop()
 
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         build_dir = config.WORK_DIR / f"{timestamp}-{player}"
@@ -476,7 +647,16 @@ def run_build(
         # 5. Rendering and voxelizing
         send_message(rcon, player, "Rendering...")
         stls = build.render_parts(scad, list(blocks), build_dir)
-        grid, palette = build.voxelize(stls, blocks, S)
+        # 6. Build at the design's own size if that space is free. Shrinking to S can erase
+        #    1-block walls, so only shrink when the full size doesn't fit here.
+        grid, palette = build.voxelize(stls, blocks, config.MAX_SIZE)
+        fits = check_grid_room(rcon, origin, facing, dim, grid.shape)
+        if not fits and max(grid.shape) > S:
+            grid, palette = build.voxelize(stls, blocks, S)
+            fits = check_grid_room(rcon, origin, facing, dim, grid.shape)
+            if fits:
+                send_message(rcon, player, "Shrunk the design to fit the space; thin details may be lost.")
+        (build_dir / "preview.png").write_bytes(build.preview_png(grid, palette))
         solid_count = int(np.count_nonzero(grid))
         if solid_count > config.MAX_BLOCKS:
             send_message(
@@ -486,60 +666,42 @@ def run_build(
             )
             return
 
-        # 6. Re-check room for real size
-        if not check_grid_room(rcon, origin, facing, dim, grid.shape):
+        if not fits:
             send_message(rcon, player, "Something moved into the build area. Cancelled.")
             return
 
-        # 7. Placing blocks
+        # 7. Placing blocks. When animated: scaffolding goes up first (only if the ring around
+        #    the build is free too), the crew places the build tile by tile, then it comes down.
+        driver = None
+        if crew is not None:
+            if check_grid_room(rcon, origin, facing, dim, grid.shape, grow=1):
+                scaffold = animate.Scaffold(rcon, dim, origin, facing, grid.shape)
+                scaffold.raise_(STOP.wait)
+            driver = lambda boxes, place_one: crew.build(grid.shape, boxes, place_one, STOP.wait)
         send_message(rcon, player, f"Placing {solid_count} blocks...")
-        sx = grid.shape[0]
-        fill_boxes = build.boxes(grid, config.FILL_MAX_VOLUME)
-        substitutions: dict[str, str] = {}
-        placed_blocks = 0
-        announced_milestones: set[int] = set()
-
-        for b in fill_boxes:
-            bx1, by1, bz1, bx2, by2, bz2, val = b
-            vol = (bx2 - bx1 + 1) * (by2 - by1 + 1) * (bz2 - bz1 + 1)
-            orig_block = palette[val]
-            block_to_use = substitutions.get(orig_block, orig_block)
-
-            wx1, wy1, wz1, wx2, wy2, wz2 = build.box_to_world(b, sx, origin, facing, config.GAP)
-            cmd = f"execute in {dim} run fill {wx1} {wy1} {wz1} {wx2} {wy2} {wz2} {block_to_use}"
-            reply = rcon.command(cmd)
-
-            if reply.startswith("Successfully filled") or reply.startswith("No blocks were filled"):
-                pass
-            else:
-                logger.warning(
-                    "Block %r rejected by server (%s). Substituting %s",
-                    block_to_use,
-                    reply.strip(),
-                    config.FALLBACK_BLOCK,
-                )
-                substitutions[orig_block] = config.FALLBACK_BLOCK
-                retry_cmd = (
-                    f"execute in {dim} run fill {wx1} {wy1} {wz1} {wx2} {wy2} {wz2} "
-                    f"{config.FALLBACK_BLOCK}"
-                )
-                rcon.command(retry_cmd)
-
-            placed_blocks += vol
-            pct = int((placed_blocks * 100) / solid_count)
-            for m in (25, 50, 75):
-                if pct >= m and m not in announced_milestones:
-                    announced_milestones.add(m)
-                    send_message(rcon, player, f"Placing blocks... {m}%")
-
-            delay = max(0.02, vol / config.BLOCKS_PER_SECOND)
-            time.sleep(delay)
+        placed = place_grid(
+            rcon,
+            player,
+            grid,
+            palette,
+            origin,
+            facing,
+            dim,
+            lambda msg: send_message(rcon, player, msg),
+            driver=driver,
+        )
+        if scaffold is not None:
+            scaffold.lower()
+            scaffold = None
 
         # 8. Finished
-        elapsed = int(time.time() - start_time)
-        mins = elapsed // 60
-        secs = elapsed % 60
-        send_message(rcon, player, f"Done: {solid_count} blocks in {mins}m {secs}s.")
+        if STOP.is_set():
+            send_message(rcon, player, f"Stopped after {placed} blocks.")
+        else:
+            elapsed = int(time.time() - start_time)
+            mins = elapsed // 60
+            secs = elapsed % 60
+            send_message(rcon, player, f"Done: {solid_count} blocks in {mins}m {secs}s.")
 
     except Exception as e:
         logger.exception("Build failed for player %s: %s", player, e)
@@ -548,6 +710,14 @@ def run_build(
         if len(reason) > 100:
             reason = reason[:97] + "..."
         send_message(rcon, player, f"Build failed: {reason}")
+    finally:
+        # Errors, refusals and !designstop all end here, so nothing is left behind.
+        if survey is not None:
+            survey.stop()
+        if scaffold is not None:
+            scaffold.lower()
+        if crew is not None:
+            crew.remove()
 
 
 def run_offline_build(
@@ -564,7 +734,7 @@ def run_offline_build(
     if image_url:
         image_png = load_image_png(image_url)
 
-    provider = (ai.lower() if ai else None) or get_provider()
+    provider = ai.lower() if ai else "gemini"
     if scad_file and blocks_file:
         scad = Path(scad_file).read_text(encoding="utf-8")
         blocks_data = json.loads(Path(blocks_file).read_text(encoding="utf-8"))
@@ -582,6 +752,7 @@ def run_offline_build(
 
     build_dir = config.WORK_DIR / f"offline-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     build_dir.mkdir(parents=True, exist_ok=True)
+    (build_dir / "blocks.json").write_text(json.dumps(blocks, indent=2), encoding="utf-8")
 
     t0 = time.time()
     stls = build.render_parts(scad, list(blocks), build_dir)
@@ -591,12 +762,17 @@ def run_offline_build(
     grid, palette = build.voxelize(stls, blocks, size)
     t_vox = time.time() - t0
 
+    preview_path = build_dir / "preview.png"
+    preview_path.write_bytes(build.preview_png(grid, palette))
+
     t_total = time.time() - t_total_start
     solid_count = int(np.count_nonzero(grid))
 
     print(f"Block count: {solid_count}")
     print(f"Grid size: {grid.shape}")
     print(f"Palette: {palette}")
+    print(f"Preview: {preview_path}")
+    print(f"Folder: {build_dir}")
     print("Timings:")
     print(f"  Design:   {t_design:.2f}s")
     print(f"  Render:   {t_render:.2f}s")
@@ -651,12 +827,264 @@ def tail_log(log_path: Path) -> Iterator[str]:
                 prev_size = cur_stat.st_size
 
 
+def parse_stop_command(message: str) -> bool:
+    """Parses a message for the !designstop command (case-insensitive, exact word)."""
+    return message.strip().lower() == "!designstop"
+
+
+def parse_help_command(message: str) -> bool:
+    """Parses a message for the !designhelp command (case-insensitive, exact word)."""
+    return message.strip().lower() == "!designhelp"
+
+
+def parse_pixelart_command(message: str) -> tuple[bool, str | None, int | None]:
+    """Parses a message for the !pixelart command.
+
+    Returns (is_command, image_url_or_None, width_or_None).
+    If it is a !pixelart command but has invalid arguments, returns (True, None, None).
+    """
+    msg = message.strip()
+    if not (msg.lower().startswith("!pixelart") and (len(msg) == 9 or msg[9].isspace())):
+        return False, None, None
+
+    rest = msg[9:].strip()
+    match = URL_RE.search(rest)
+    if not match:
+        return True, None, None
+
+    url = match.group(0)
+    tokens = (rest[:match.start()] + " " + rest[match.end():]).split()
+    if not tokens:
+        return True, url, None
+    if len(tokens) == 1:
+        try:
+            val = int(tokens[0])
+            if val > 0:
+                return True, url, val
+            return True, None, None
+        except ValueError:
+            return True, None, None
+
+    return True, None, None
+
+
+def run_pixelart(
+    rcon: Rcon,
+    player: str,
+    source: str,
+    width: int | None = None,
+) -> None:
+    """Executes the pixel art placement pipeline."""
+    STOP.clear()
+    start_time = time.time()
+    try:
+        # a. Player Pos/Rotation/Dimension -> origin, facing, top
+        pos_reply = rcon.command(f"data get entity {player} Pos")
+        rot_reply = rcon.command(f"data get entity {player} Rotation")
+        dim_reply = rcon.command(f"data get entity {player} Dimension")
+
+        pos = parse_pos_reply(pos_reply)
+        rot = parse_rotation_reply(rot_reply)
+        dim = parse_dimension_reply(dim_reply)
+
+        origin = (math.floor(pos[0]), math.floor(pos[1]), math.floor(pos[2]))
+        facing = build.facing_from_yaw(rot[0])
+        top = 319 if dim in ("minecraft:overworld", "overworld") else 255
+
+        # b. Image download & native_image
+        try:
+            raw_bytes = download_image(source)
+            img = pixelart.native_image(raw_bytes, config.PIXELART_MAX_SIDE)
+        except pixelart.PixelArtError as e:
+            send_message(rcon, player, str(e), prefix="[pixelart]")
+            return
+        except Exception as e:
+            logger.warning("Couldn't load image %s: %s", source, e)
+            send_message(rcon, player, "Couldn't load that image.", prefix="[pixelart]")
+            return
+
+        # c. Size selection
+        chosen_w: int | None = None
+        final_h: int = 0
+        if width is not None:
+            w, h = pixelart.fit_size(img, width)
+            if origin[1] + h - 1 > top - 1 or not check_grid_room(rcon, origin, facing, dim, (w, 1, h)):
+                send_message(
+                    rcon,
+                    player,
+                    f"Not enough room for a {w}x{h} picture here. Face open space and try again.",
+                    prefix="[pixelart]",
+                )
+                return
+            chosen_w = w
+            final_h = h
+        else:
+            candidate_w = img.width
+            last_tried: tuple[int, int] | None = None
+            while candidate_w >= config.PIXELART_MIN_WIDTH:
+                w, h = pixelart.fit_size(img, candidate_w)
+                if origin[1] + h - 1 > top - 1:
+                    max_h = top - origin[1]
+                    if max_h < 1:
+                        last_tried = (w, h)
+                        break
+                    target_w = max(1, int(candidate_w * max_h / h))
+                    w, h = pixelart.fit_size(img, target_w)
+                    while target_w > 1 and origin[1] + h - 1 > top - 1:
+                        target_w -= 1
+                        w, h = pixelart.fit_size(img, target_w)
+                    candidate_w = target_w
+                    if candidate_w < config.PIXELART_MIN_WIDTH:
+                        last_tried = (w, h)
+                        break
+
+                last_tried = (w, h)
+                if check_grid_room(rcon, origin, facing, dim, (w, 1, h)):
+                    chosen_w = w
+                    final_h = h
+                    break
+                candidate_w = int(candidate_w * 0.8)
+
+            if chosen_w is None:
+                last_w, last_h = last_tried if last_tried is not None else pixelart.fit_size(img, config.PIXELART_MIN_WIDTH)
+                send_message(
+                    rcon,
+                    player,
+                    f"Not enough room for a {last_w}x{last_h} picture here. Face open space and try again.",
+                    prefix="[pixelart]",
+                )
+                return
+
+        # d. Grid and preview artifacts
+        grid, palette = pixelart.image_to_grid(img, chosen_w)
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        build_dir = config.WORK_DIR / f"{timestamp}-{player}-pixelart"
+        build_dir.mkdir(parents=True, exist_ok=True)
+
+        ext = Path(source.split("?")[0]).suffix
+        if not ext or len(ext) > 5:
+            ext = ".png"
+        (build_dir / f"source{ext}").write_bytes(raw_bytes)
+        (build_dir / "preview.png").write_bytes(pixelart.preview_png(grid, palette))
+
+        # e. Announce and place
+        blocks = int(np.count_nonzero(grid))
+        colours = max(0, len(palette) - 1)
+        fill_boxes = build.boxes(grid, config.FILL_MAX_VOLUME)
+        eta = format_estimate(estimate_seconds(fill_boxes))
+
+        send_message(
+            rcon,
+            player,
+            f"Pixel art: {chosen_w}x{final_h}, {blocks:,} blocks, {colours} colours. Placing ({eta})...",
+            prefix="[pixelart]",
+        )
+
+        placed = place_grid(
+            rcon,
+            player,
+            grid,
+            palette,
+            origin,
+            facing,
+            dim,
+            lambda msg: send_message(rcon, player, msg, prefix="[pixelart]"),
+        )
+
+        if STOP.is_set():
+            send_message(
+                rcon,
+                player,
+                f"Stopped after {placed} blocks.",
+                prefix="[pixelart]",
+            )
+        else:
+            elapsed = int(time.time() - start_time)
+            mins = elapsed // 60
+            secs = elapsed % 60
+            send_message(
+                rcon,
+                player,
+                f"Done: {placed} blocks in {mins}m {secs}s.",
+                prefix="[pixelart]",
+            )
+
+    except Exception as e:
+        logger.exception("Pixel art failed for player %s: %s", player, e)
+        err_str = str(e).strip()
+        reason = err_str.splitlines()[0] if err_str else type(e).__name__
+        if len(reason) > 100:
+            reason = reason[:97] + "..."
+        send_message(rcon, player, f"Pixel art failed: {reason}", prefix="[pixelart]")
+
+
+def run_offline_pixelart(source: str, width: int | None = None) -> None:
+    """Processes pixel art offline without RCON."""
+    raw_bytes = download_image(source)
+    img = pixelart.native_image(raw_bytes, config.PIXELART_MAX_SIDE)
+
+    w_target = width if width is not None else img.width
+    w, h = pixelart.fit_size(img, w_target)
+    grid, palette = pixelart.image_to_grid(img, w)
+
+    blocks = int(np.count_nonzero(grid))
+    colours = max(0, len(palette) - 1)
+    fill_boxes = build.boxes(grid, config.FILL_MAX_VOLUME)
+    eta = format_estimate(estimate_seconds(fill_boxes))
+
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    work_folder = config.WORK_DIR / f"{timestamp}-pixelart"
+    work_folder.mkdir(parents=True, exist_ok=True)
+    preview_path = work_folder / "preview.png"
+    preview_path.write_bytes(pixelart.preview_png(grid, palette))
+
+    print(f"Native size: {img.width}x{img.height}")
+    print(f"Final size: {w}x{h}")
+    print(f"Block count: {blocks}")
+    print(f"Colour count: {colours}")
+    print(f"Fill boxes: {len(fill_boxes)}")
+    print(f"ETA: {eta}")
+    print(f"Preview: {preview_path}")
+
+
 def handle_chat_line(
     player: str,
     message: str,
     rcon: Rcon | None = None,
     build_lock: threading.Lock | None = None,
 ) -> None:
+    if parse_help_command(message):
+        # Anyone may ask; it only lists the commands (which stay op-only).
+        for line in HELP_LINES:
+            send_message(rcon, player, line)
+        return
+
+    is_anim_cmd, anim_arg = parse_anim_command(message)
+    if is_anim_cmd:
+        if not is_op(player, config.OPS_FILE):
+            send_message(rcon, player, "Only ops can use !designanim.")
+            return
+        if anim_arg is None:
+            send_message(rcon, player, f"Builder animation: {'on' if get_animate() else 'off'}.")
+        elif anim_arg.lower() in ("on", "off"):
+            save_setting("animate", anim_arg.lower() == "on")
+            send_message(rcon, player, f"Builder animation turned {anim_arg.lower()}.")
+        else:
+            send_message(rcon, player, "Usage: !designanim on|off")
+        return
+
+    if parse_stop_command(message):
+        if not is_op(player, config.OPS_FILE):
+            send_message(rcon, player, "Only ops can use !designstop.")
+            return
+
+        if build_lock is not None and build_lock.locked():
+            STOP.set()
+            send_message(rcon, player, "Stopping...")
+        else:
+            send_message(rcon, player, "Nothing is running.")
+        return
+
     is_ai_cmd, ai_arg = parse_ai_command(message)
     if is_ai_cmd:
         if not is_op(player, config.OPS_FILE):
@@ -675,6 +1103,36 @@ def handle_chat_line(
             send_message(rcon, player, f"AI set to {PROVIDER_NAMES[choice]}.")
         else:
             send_message(rcon, player, "Usage: !designai claude|gemini")
+        return
+
+    is_px_cmd, px_url, px_width = parse_pixelart_command(message)
+    if is_px_cmd:
+        if not is_op(player, config.OPS_FILE):
+            send_message(rcon, player, "Only ops can use !pixelart.", prefix="[pixelart]")
+            return
+
+        if not px_url:
+            send_message(rcon, player, "Usage: !pixelart <image link> [width]", prefix="[pixelart]")
+            return
+
+        if build_lock is not None and not build_lock.acquire(blocking=False):
+            send_message(
+                rcon,
+                player,
+                "A build is already running. Try again when it finishes.",
+                prefix="[pixelart]",
+            )
+            return
+
+        def px_worker():
+            try:
+                run_pixelart(rcon, player, px_url, width=px_width)
+            finally:
+                if build_lock is not None:
+                    build_lock.release()
+
+        t = threading.Thread(target=px_worker, daemon=True)
+        t.start()
         return
 
     is_cmd, desc, img_url = parse_command(message)
@@ -731,10 +1189,20 @@ def main() -> None:
         type=str,
         choices=["claude", "gemini"],
         default=None,
-        help="AI provider override for this run",
+        help="AI provider override for this run (offline runs default to gemini)",
     )
+    parser.add_argument("--pixelart", type=str, default=None, help="Image URL or file path for pixel art")
+    parser.add_argument("--width", type=int, default=None, help="Width for pixel art")
 
     args = parser.parse_args()
+
+    if args.pixelart:
+        if args.player:
+            rcon = Rcon(*config.rcon_settings())
+            run_pixelart(rcon, args.player, args.pixelart, width=args.width)
+        else:
+            run_offline_pixelart(args.pixelart, width=args.width)
+        return
 
     # Determine if running in one-shot mode or service mode
     is_one_shot = (args.once is not None) or (args.scad is not None) or (args.image is not None and args.player is not None)
@@ -772,6 +1240,10 @@ def main() -> None:
     # Service mode
     rcon = Rcon(*config.rcon_settings())
     build_lock = threading.Lock()
+    try:
+        rcon.command(animate.kill_crew_command())  # builders left over from a crash
+    except Exception as e:
+        logger.warning("Couldn't remove leftover builders: %s", e)
 
     logger.info("Starting mcmcp service, tailing %s...", config.LOG_FILE)
     try:

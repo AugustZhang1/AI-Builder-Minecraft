@@ -38,10 +38,30 @@ ROOM_SIZES = (64, 48, 32, 24, 16)  # free-space sizes tried, largest first
 MAX_BLOCKS = 200_000               # solid blocks per build
 GAP = 3                            # blocks between the player and the build's front
 FALLBACK_BLOCK = "minecraft:stone"
+ANIMATE = True                     # !design: builders, corner markers and scaffolding (animate.py)
+CREW_SIZE = 3                      # armor-stand builders
+# Never placed; swapped for FALLBACK_BLOCK. Fluids and fire, TNT, falling blocks (plus every
+# *_concrete_powder), portals, blocks survival players can't break, and spawners.
+BANNED_BLOCKS = frozenset("minecraft:" + b for b in (
+    "water", "lava", "fire", "soul_fire", "bubble_column", "tnt",
+    "sand", "red_sand", "gravel", "suspicious_sand", "suspicious_gravel", "dragon_egg",
+    "anvil", "chipped_anvil", "damaged_anvil", "pointed_dripstone", "scaffolding", "powder_snow",
+    "nether_portal", "end_portal", "end_gateway", "end_portal_frame",
+    "bedrock", "barrier", "light", "structure_void", "structure_block", "jigsaw",
+    "command_block", "chain_command_block", "repeating_command_block", "reinforced_deepslate",
+    "moving_piston", "piston_head", "spawner", "trial_spawner", "vault",
+))
 
 # Placement rate limit.
 FILL_MAX_VOLUME = 4096             # blocks per /fill command (hard game limit is 32,768)
 BLOCKS_PER_SECOND = 4000
+MIN_COMMAND_DELAY = 0.02           # seconds between placement commands
+
+# !pixelart (no AI). Sizes come from the image and the free space; these are sanity caps.
+PIXELART_MAX_SIDE = 512            # px, longest side after sprite detection
+PIXELART_MIN_WIDTH = 8
+PALETTE_FILE = Path(__file__).resolve().parent / "palette.json"
+BLOCK_COLORS_FILE = Path(__file__).resolve().parent / "block_colors.json"  # build previews
 
 IMAGE_MAX_BYTES = 8_000_000
 IMAGE_MAX_SIDE = 1568              # px, longest side sent to Claude
