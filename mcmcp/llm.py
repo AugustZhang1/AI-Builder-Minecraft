@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import logging
 import math
@@ -15,6 +16,8 @@ import threading
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Callable
+
+from PIL import Image
 
 try:
     from . import config
@@ -34,6 +37,7 @@ PART_RE = re.compile(r"^[a-z0-9_]{1,32}$")
 BLOCK_ID_RE = re.compile(r"^minecraft:[a-z0-9_]+$")
 DETAIL_RE = re.compile(r"^minecraft:[a-z0-9_]+(\[[a-z0-9_]+=[a-z0-9_]+(,[a-z0-9_]+=[a-z0-9_]+)*\])?$")
 FENCE_RE = re.compile(r"```([a-zA-Z0-9_-]*)[^\S\r\n]*\r?\n([\s\S]*?)```")
+KEEP_RE = re.compile(r"\bKEEP\b")  # the exact word the review asks for
 
 
 def _limits_line(limits: tuple[int, int, int] | int) -> str:
@@ -90,8 +94,22 @@ def _cli_command(prompt_file: Path | str | None = None) -> list[str]:
 
 
 GEMINI_RULES = (
-    "Do not use any tools, except to view the reference image file named below if there is one. "
-    "Do not create or edit files. Reply only with the two fenced blocks described above."
+    "Do not use any tools, except to read the files named below. "
+    "Do not create or edit files. Reply only with the two fenced blocks described above, "
+    "or with KEEP when asked to review."
+)
+
+REVIEW_TEXT = (
+    "Your design was built. The image is a preview of the result as blocks: "
+    "two angled views, then front, side and top views (the player sees the front). "
+    "Check it against the request (and the reference image, if any): "
+    "1. Does it look like the subject: silhouette, proportions, signature features? "
+    "2. Anything broken: a part missing, floating pieces, parts poking through each other, "
+    "features merged into blobs, faces or windows that don't read, accidental faces? "
+    "3. Large flat single-colour areas, or neighbouring parts in the same tone? "
+    "If nothing is clearly wrong, reply with exactly KEEP. "
+    "Otherwise fix the 1-3 biggest problems and reply with the complete corrected design "
+    "in the same two fenced blocks (same rules and limits), keeping everything that already works."
 )
 
 
@@ -100,6 +118,8 @@ def _build_gemini_user_text(
     limits: tuple[int, int, int] | int,
     image_png: bytes | None = None,
     ref_path: Path | None = None,
+    review: tuple[str, bytes] | None = None,
+    preview_path: Path | None = None,
 ) -> str:
     desc = description.strip() if description else ""
     limits_line = _limits_line(limits)
@@ -111,6 +131,16 @@ def _build_gemini_user_text(
     if image_png:
         target_path = (ref_path or (_CLI_WORKDIR / "ref.png")).resolve()
         user_text += f"\nThe reference image is the file {target_path}. Look at it first."
+
+    if review:
+        # The design goes in a file: on the command line it can pass Windows' length limit.
+        design_file = (_CLI_WORKDIR / "design.txt").resolve()
+        target_preview = (preview_path or (_CLI_WORKDIR / "preview.png")).resolve()
+        user_text += (
+            f"\n\nYour design is the file {design_file}."
+            f"\nThe preview image is the file {target_preview}. Look at both first."
+            f"\n\n{REVIEW_TEXT}"
+        )
     return user_text
 
 
@@ -119,10 +149,15 @@ def _build_gemini_prompt(
     limits: tuple[int, int, int] | int,
     image_png: bytes | None = None,
     ref_file: Path | None = None,
+    review: tuple[str, bytes] | None = None,
+    preview_file: Path | None = None,
 ) -> str:
     system_prompt = _prepare_prompt_text().rstrip()
     ref_path = (ref_file or (_CLI_WORKDIR / "ref.png")).resolve()
-    user_text = _build_gemini_user_text(description, limits, image_png, ref_path=ref_path)
+    prev_path = (preview_file or (_CLI_WORKDIR / "preview.png")).resolve()
+    user_text = _build_gemini_user_text(
+        description, limits, image_png, ref_path=ref_path, review=review, preview_path=prev_path
+    )
     return f"{system_prompt}\n\n{GEMINI_RULES}\n\n{user_text}"
 
 
@@ -145,6 +180,7 @@ def _build_stdin_payload(
     description: str,
     limits: tuple[int, int, int] | int,
     image_png: bytes | None = None,
+    review: tuple[str, bytes] | None = None,
 ) -> str:
     """Formats the single stream-json line for stdin."""
     desc = description.strip() if description else ""
@@ -168,6 +204,25 @@ def _build_stdin_payload(
         "type": "text",
         "text": user_text,
     })
+
+    if review:
+        raw, preview_png = review
+        content.append({
+            "type": "text",
+            "text": f"Your design:\n{raw}",
+        })
+        content.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": base64.b64encode(preview_png).decode("ascii"),
+            },
+        })
+        content.append({
+            "type": "text",
+            "text": REVIEW_TEXT,
+        })
 
     msg = {
         "type": "user",
@@ -253,6 +308,7 @@ def _cli_text(
     image_png: bytes | None = None,
     timeout: float = config.CLAUDE_TIMEOUT,
     provider: str = "claude",
+    review: tuple[str, bytes] | None = None,
 ) -> Iterator[str]:
     """Runs the Claude or Gemini CLI and yields text chunks synchronously."""
     if provider not in config.PROVIDERS:
@@ -263,7 +319,9 @@ def _cli_text(
     if provider == "claude":
         prompt_file = _prepare_prompt_file(_CLI_WORKDIR)
         cmd = _cli_command(prompt_file)
-        stdin_payload: str | None = _build_stdin_payload(description, limits, image_png)
+        stdin_payload: str | None = _build_stdin_payload(
+            description, limits, image_png=image_png, review=review
+        )
         stdin_mode = subprocess.PIPE
         delta_fn = _cli_delta
         cli_name = "claude"
@@ -272,7 +330,19 @@ def _cli_text(
         ref_file.unlink(missing_ok=True)
         if image_png:
             ref_file.write_bytes(image_png)
-        prompt_text = _build_gemini_prompt(description, limits, image_png, ref_file=ref_file)
+        preview_file = _CLI_WORKDIR / "preview.png"
+        preview_file.unlink(missing_ok=True)
+        if review:
+            (_CLI_WORKDIR / "design.txt").write_text(review[0], encoding="utf-8")
+            preview_file.write_bytes(review[1])
+        prompt_text = _build_gemini_prompt(
+            description,
+            limits,
+            image_png,
+            ref_file=ref_file,
+            review=review,
+            preview_file=preview_file,
+        )
         cmd = _agy_command(prompt_text)
         stdin_payload = None
         stdin_mode = subprocess.DEVNULL
@@ -566,3 +636,47 @@ def design(
         raise
     except Exception as exc:
         raise LlmError(f"Design failed: {exc}") from exc
+
+
+def review(
+    description: str,
+    limits: tuple[int, int, int] | int,
+    raw: str,
+    preview_png: bytes,
+    image_png: bytes | None = None,
+    provider: str = "claude",
+    on_text: Callable[[str], None] | None = None,
+) -> tuple[str, dict[str, str], dict[str, dict[str, float]], list[tuple[int, int, int, int, int, int, str]], str] | None:
+    """Reviews the build preview and either returns None (KEEP) or a corrected design 5-tuple."""
+    if provider not in config.PROVIDERS:
+        raise LlmError(f"Unknown provider: {provider!r}. Must be one of {config.PROVIDERS}")
+
+    try:
+        with Image.open(io.BytesIO(preview_png)) as img:
+            img = img.convert("RGB")
+            img.thumbnail((config.IMAGE_MAX_SIDE, config.IMAGE_MAX_SIDE))
+            out = io.BytesIO()
+            img.save(out, format="PNG")
+            thumb_png = out.getvalue()
+
+        chunks: list[str] = []
+        for chunk in _cli_text(
+            description,
+            limits,
+            image_png=image_png,
+            timeout=config.CLAUDE_TIMEOUT,
+            provider=provider,
+            review=(raw, thumb_png),
+        ):
+            chunks.append(chunk)
+            if on_text:
+                on_text(chunk)
+        reply = "".join(chunks)
+        stripped = reply.strip()
+        if "```" not in stripped and KEEP_RE.search(stripped):
+            return None
+        return parse_reply(reply) + (reply,)
+    except LlmError:
+        raise
+    except Exception as exc:
+        raise LlmError(f"Review failed: {exc}") from exc

@@ -58,6 +58,7 @@ HELP_LINES = (
     "!designstop - stops the build that is running",
     "!designai [claude|gemini] - shows or switches the AI",
     "!designanim [on|off] - shows or switches the builder crew animation",
+    "!designreview [on|off] - shows or switches the AI's check of its own build",
     "!designhelp - shows this list",
 )
 
@@ -98,6 +99,12 @@ def get_animate() -> bool:
     return value if isinstance(value, bool) else config.ANIMATE
 
 
+def get_review() -> bool:
+    """Whether !design checks a preview of its build once (set with !designreview; default config.REVIEW)."""
+    value = load_settings().get("review")
+    return value if isinstance(value, bool) else config.REVIEW
+
+
 def _parse_word_command(message: str, word: str) -> tuple[bool, str | None]:
     """Parses `word [arg]` (case-insensitive). Returns (is_command, arg_or_None)."""
     msg = message.strip()
@@ -116,6 +123,11 @@ def parse_ai_command(message: str) -> tuple[bool, str | None]:
 def parse_anim_command(message: str) -> tuple[bool, str | None]:
     """Parses a message for the !designanim command. Returns (is_command, arg_or_None)."""
     return _parse_word_command(message, "!designanim")
+
+
+def parse_review_command(message: str) -> tuple[bool, str | None]:
+    """Parses a message for the !designreview command. Returns (is_command, arg_or_None)."""
+    return _parse_word_command(message, "!designreview")
 
 
 def parse_place_command(message: str) -> bool:
@@ -713,6 +725,59 @@ def voxelize_design(
     return grid, palette, dboxes, skipped
 
 
+def review_design(
+    description: str,
+    limits: tuple[int, int, int],
+    image_png: bytes | None,
+    provider: str,
+    raw: str,
+    build_dir: Path,
+    send_fn: Callable[[str], Any],
+    provider_name: str,
+) -> tuple[str, dict[str, str], dict[str, dict[str, float]], list[tuple[int, int, int, int, int, int, str]], np.ndarray, list[str], list[tuple[int, int, int, int, int, int, str]], bool] | None:
+    """Asks the AI to check a preview of its build once; returns revision data or None to keep."""
+    try:
+        send_fn("Checking the design...")
+        preview_png = (build_dir / "preview.png").read_bytes()
+        heartbeat = Heartbeat(send_fn, provider_name, config.HEARTBEAT_SECONDS)
+        heartbeat.start()
+        try:
+            rev = llm.review(
+                description,
+                limits,
+                raw,
+                preview_png,
+                image_png=image_png,
+                provider=provider,
+            )
+        finally:
+            heartbeat.stop()
+
+        if rev is None:
+            send_fn("Review: kept the design.")
+            return None
+
+        rev_scad, rev_blocks, rev_mix, rev_details, rev_raw = rev
+        review_dir = build_dir / "review"
+        review_dir.mkdir(parents=True, exist_ok=True)
+        (review_dir / "response.txt").write_text(rev_raw, encoding="utf-8")
+        (review_dir / "design.scad").write_text(rev_scad, encoding="utf-8")
+        (review_dir / "blocks.json").write_text(
+            json.dumps({"blocks": rev_blocks, "mix": rev_mix, "details": rev_details}, indent=2),
+            encoding="utf-8",
+        )
+        stls = build.render_parts(rev_scad, list(rev_blocks), review_dir)
+        grid, palette, dboxes, skipped = voxelize_design(
+            rev_scad, stls, rev_blocks, rev_mix, rev_details, limits, review_dir
+        )
+        send_fn("Review: improved the design.")
+        return rev_scad, rev_blocks, rev_mix, rev_details, grid, palette, dboxes, skipped
+    except Exception as e:
+        logger.warning("Review failed: %s", e)
+        send_fn("Review failed; building the first design.")
+        return None
+
+
 def place_design(
     rcon: Rcon,
     player: str,
@@ -963,6 +1028,21 @@ def run_build(
         send_message(rcon, player, "Rendering...")
         stls = build.render_parts(scad, list(blocks), build_dir)
         grid, palette, dboxes, skipped = voxelize_design(scad, stls, blocks, mix, details, limits, build_dir)
+
+        if get_review() and (scad_override is None or blocks_override is None) and not STOP.is_set():
+            rev = review_design(
+                description,
+                limits,
+                image_png,
+                provider,
+                raw,
+                build_dir,
+                lambda msg: send_message(rcon, player, msg),
+                provider_name,
+            )
+            if rev is not None:
+                scad, blocks, mix, details, grid, palette, dboxes, skipped = rev
+
         if skipped:
             send_message(rcon, player, "Scaled the design down to fit; skipped the detail blocks.")
 
@@ -1040,6 +1120,26 @@ def run_offline_build(
     grid, palette, dboxes, skipped = voxelize_design(scad, stls, blocks, mix, details, limits, build_dir)
     t_vox = time.time() - t0
 
+    t_review = 0.0
+    reviewed = False
+    if get_review() and not (scad_file and blocks_file):
+        provider_name = PROVIDER_NAMES.get(provider, provider.capitalize())
+        t0 = time.time()
+        rev = review_design(
+            description,
+            limits,
+            image_png,
+            provider,
+            raw,
+            build_dir,
+            print,
+            provider_name,
+        )
+        t_review = time.time() - t0
+        if rev is not None:
+            reviewed = True
+            scad, blocks, mix, details, grid, palette, dboxes, skipped = rev
+
     t_total = time.time() - t_total_start
     total_blocks = int(np.count_nonzero(grid)) + detail_block_count(dboxes)
 
@@ -1048,10 +1148,14 @@ def run_offline_build(
     print(f"Grid size: {grid.shape}")
     print(f"Previews: preview.png, mesh.png, mesh.glb")
     print(f"Folder: {build_dir}")
+    if reviewed:
+        print(f"Review folder: {build_dir / 'review'}")
     print("Timings:")
     print(f"  Design:   {t_design:.2f}s")
     print(f"  Render:   {t_render:.2f}s")
     print(f"  Voxelize + previews: {t_vox:.2f}s")
+    if get_review() and not (scad_file and blocks_file):
+        print(f"  Review:   {t_review:.2f}s")
     print(f"  Total:    {t_total:.2f}s")
 
 
@@ -1346,6 +1450,20 @@ def handle_chat_line(
             send_message(rcon, player, f"Builder animation turned {anim_arg.lower()}.")
         else:
             send_message(rcon, player, "Usage: !designanim on|off")
+        return
+
+    is_review_cmd, review_arg = parse_review_command(message)
+    if is_review_cmd:
+        if not is_op(player, config.OPS_FILE):
+            send_message(rcon, player, "Only ops can use !designreview.")
+            return
+        if review_arg is None:
+            send_message(rcon, player, f"Design review: {'on' if get_review() else 'off'}.")
+        elif review_arg.lower() in ("on", "off"):
+            save_setting("review", review_arg.lower() == "on")
+            send_message(rcon, player, f"Design review turned {review_arg.lower()}.")
+        else:
+            send_message(rcon, player, "Usage: !designreview on|off")
         return
 
     if parse_stop_command(message):

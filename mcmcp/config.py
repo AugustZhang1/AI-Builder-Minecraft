@@ -23,7 +23,7 @@ OPENSCAD_TIMEOUT = 180  # seconds per part
 
 # Claude CLI (subscription).
 CLAUDE_MODEL = "claude-opus-5-5"
-CLAUDE_EFFORT = "xhigh"
+CLAUDE_EFFORT = "medium"
 CLAUDE_TIMEOUT = 900  # seconds for the whole call
 
 # Gemini through the agy CLI (Google Antigravity).
@@ -37,6 +37,7 @@ START_ROOM = 16                    # the quick free-space check before designing
 GAP = 3                            # blocks between the player and the build's front
 FALLBACK_BLOCK = "minecraft:stone"
 ANIMATE = True                     # !design: builders, corner markers and scaffolding (animate.py)
+REVIEW = True                      # !design: the AI checks a preview of its build once and may fix it
 CREW_SIZE = 3                      # armor-stand builders
 # Never placed; swapped for FALLBACK_BLOCK. Fluids and fire, TNT, falling blocks (plus every
 # *_concrete_powder), portals, blocks survival players can't break, and spawners.

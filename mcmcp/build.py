@@ -13,6 +13,7 @@ import subprocess
 
 import numpy as np
 from PIL import Image
+from scipy import ndimage
 import trimesh
 
 try:
@@ -209,6 +210,7 @@ def voxelize(
         idx_i, idx_j, idx_k = np.nonzero(sub_mask)
         grid[i_min + idx_i, j_min + idx_j, k_min + idx_k] = val
 
+    grid = drop_floaters(grid)
     occupied = np.argwhere(grid > 0)
     if len(occupied) == 0:
         raise BuildError("No solid blocks in voxelized geometry")
@@ -224,6 +226,28 @@ def voxelize(
 
     offset = (origin + min_pos).astype(int)
     return trimmed_grid, palette, offset, scale
+
+
+FLOATER_MAX_BLOCKS = 200    # floating clusters up to this many blocks are dropped,
+FLOATER_MAX_SHARE = 0.005   # if they are also at most this share of the whole build
+
+
+def drop_floaters(grid: np.ndarray) -> np.ndarray:
+    """Drop small clusters of blocks that touch neither the main build nor the bottom layer:
+    misplaced windows, trims and spikes that would hang in the air. Blocks touching at an
+    edge or corner count as connected; the largest cluster is always kept."""
+    labels, n = ndimage.label(grid > 0, structure=np.ones((3, 3, 3)))
+    if n < 2:
+        return grid
+    sizes = np.bincount(labels.ravel())
+    ground = np.nonzero(np.any(grid > 0, axis=(0, 1)))[0][0]
+    drop = sizes <= min(FLOATER_MAX_BLOCKS, FLOATER_MAX_SHARE * sizes[1:].sum())
+    drop[0] = False                               # air
+    drop[np.argmax(sizes[1:]) + 1] = False        # the main build
+    drop[np.unique(labels[:, :, ground])] = False  # anything standing on the bottom layer
+    out = grid.copy()
+    out[drop[labels]] = 0
+    return out
 
 
 MIX_MIN_BASE = 0.7  # the base block keeps at least this share of a mixed surface

@@ -21,6 +21,7 @@ Output ONLY two markdown fenced blocks in this exact order, with NO prose, expla
 - The player stands in front looking in the +Y direction. The front (a building's entrance and facade, a sculpture's face) MUST face the player at y = 0.
 - The request gives the limits: how wide (X), deep (Y) and tall (Z) the build may be. Stay inside them.
 - If the description asks for a size, build exactly that size. Otherwise scale by subject: houses 10-25 blocks, castles and cathedrals 60-140, landmarks as large as fits, statues and creatures as tall as described ("large" or "huge" means 60+ blocks tall). Bigger builds have room for more detail.
+- Where the size is up to you, make it big enough that signature features (a face, a hand, an engine) are at least 3 blocks across; a figure's head at least 7 blocks wide so a face fits.
 
 # DESIGN PROCESS
 Think this through before writing code:
@@ -43,17 +44,20 @@ Think this through before writing code:
 - At top level, instantiate each part:
   if (part == "all" || part == "<name>") <name>();
 - Every feature must be at least 1 unit thick; anything thinner vanishes when turned into blocks. A 1-unit feature must also sit exactly between whole numbers (x from 0 to 1, not from -0.5 to 0.5), or it vanishes too.
-- Buildings: geometry on integer coordinates. Sculptures: curves, rotations and fractional coordinates are fine, but make sculpted features at least 2 units thick.
-- Buildings: walls, floors and roofs at least 1 unit thick; interiors hollow; openings (doors, windows, rooms) are empty space made with `difference()`.
+- Straight walls, floors and openings sit on integer coordinates. Round, sloped and tapering forms (towers, domes, arches, hulls, bodies, limbs) are cylinders, cones, spheres and `hull()` on buildings too, not stepped stacks of boxes (pitched roofs may step, with stairs on the edges); curved walls and sculpted features are at least 2 units thick.
+- Buildings: walls, floors and roofs at least 1 unit thick; interiors hollow; openings (doors, windows, rooms) are empty space made with `difference()`. Hollow a curved or sloped form by subtracting a smaller copy of the same shape, offset inward, so no room breaks through the outside.
 - Sculptures: solid shapes, no interior, no doors, windows or roof unless the description asks for them.
 - Parts may overlap. Later parts in the JSON "blocks" dictionary override earlier ones (e.g. list "glass", "trim", and "light" after "walls").
+- Keep pieces lined up (misplaced coordinates are the main cause of floating blocks):
+  - Put shared sizes and centres in variables at the top (`tower_r = 6; head_c = [0, 20, 60];`) and build every feature from them.
+  - Cut an opening and fill it from the same helper module (`module windows()`): the wall part does `difference() { ...; windows(); }` and the glass part uses `windows()` again, so glass always sits in its opening.
+  - `rotate()` turns around the origin: to ring features around a centre, write `translate(centre) rotate([0, 0, a]) translate([r, 0, 0]) ...`, never `rotate(...) translate(far away)`.
 - Constraints:
   - NO `import`, `include`, `use`, or `surface`.
   - `$fn` at most 48 (use 32-48 for large curved shapes so they come out smooth).
   - No `minkowski()`. `hull()` only over a few small primitives (e.g. two spheres for a limb).
 
 # BUILDING TECHNIQUES
-- No flat wall area bigger than about 5x5 without relief.
 - Pillars or columns stick out 1 block from the wall face at corners and between bays.
 - Windows are recessed: glass sits 1 block behind the wall face, with a frame or sill around the opening.
 - A trim band marks each floor line; a base course 1 block wider than the walls sits at the bottom; a cornice runs under the roof.
@@ -64,11 +68,20 @@ Think this through before writing code:
 
 # SCULPTURE TECHNIQUES
 - Never build a sculpture only from boxes: bodies, limbs, heads, helmets, capes and creatures are spheres, scaled spheres, cylinders, cones and hulls. Boxes are only for pedestals, blades, straight plates and trims.
-- Get the proportions right first (a heroic human figure is about 8 heads tall), then the pose.
+- Get the proportions right first (a heroic human figure is about 8 heads tall), then the pose. Ornaments (crests, horns, plumes, spikes, antennas) stay small next to what carries them, e.g. a crest no taller than the head.
 - Model from overlapping primitives: spheres, scaled spheres (`scale([a, b, c]) sphere(r)`), cylinders and cones (`cylinder(h, r1, r2)`), boxes, and `hull()` of two or three small spheres for limbs and tapered shapes. Use `rotate()` for the pose.
 - Anything that must survive as blocks (fingers, a blade, a staff, horns) is at least 2 blocks thick at large scale; merge fingers into a hand.
 - Surface layering gives detail: armour plates, belts, straps and trims as slightly larger shells in contrasting blocks; recessed eyes; a cape as a curved shell at least 1 block thick.
+- At block scale two dark spots or holes side by side read as eyes. Only put a face where the subject has one; keep emblems one simple shape, and avoid symmetric dark pairs on the front of a body.
 - A pedestal with a trim band and a base course. Age and weathering come from texture mixes (mossy and cracked variants), not extra parts.
+
+# SMALL DETAILS
+Faces, windows, portholes, emblems and panel lines are drawn block by block, like pixel art, on every kind of build:
+- First give the area a flat front at a whole-number y: a flat face plane on a head, a flat panel on a hull or wall.
+- Then place each feature as whole cubes at integer coordinates, at least 1 block each, in a contrasting block (its own part) or as a 1-block-deep recess. A face needs about 5x5 blocks: eyes 1-2 blocks wide with a gap between, a brow ledge above them, a nose 1 block out, a mouth as a dark line.
+- Never build small features from small spheres, hulls or fractional coordinates: they merge into one lump.
+- Windows: a frame around the opening, glass or a light 1 block recessed, in regular rows or bands; a porthole is a 3x3 with the corners left out.
+- The finest level goes in "details": stairs and slabs for brows, noses and sills, iron bars and panes for grilles and mullions, trapdoors for shutters and panels, buttons for rivets.
 
 # TEXTURE MIXES
 "mix" maps a block used in "blocks" to relative weights of up to 6 variants (the base block included). Only the visible surface is mixed, in small patches.
@@ -91,9 +104,11 @@ Think this through before writing code:
 
 # QUALITY RULES
 - The front faces the player at y = 0.
-- Vary materials: contrasting blocks for different parts (e.g. base, body, trim, details).
+- Vary materials: contrasting blocks for different parts (e.g. base, body, trim, details). Neighbouring parts contrast in tone (light trim on dark plates, dark on light); similar dark parts side by side merge into one blob.
+- No flat area bigger than about 5x5 on any subject (wall, roof, hull, body, wing) without relief: bands, panels, ribs or recesses at least 1 block deep. Texture mixes are for old or natural surfaces, not for relief on machined ones.
+- Everything is attached: each part overlaps what holds it by at least 1 unit (a roof onto its walls, an arm into the body, a wheel into its axle), with no air gap, and never pokes out the far side of another part. On a curved or tapering wall, windows, trims and plates follow the wall's profile (same centre and radius, same slope), so they cannot float off it.
 - Unless the subject floats (a floating island, a ship in the sky), every part connects to structure below it down to z = 0.
-- Light it where it fits, with `minecraft:glowstone`, `minecraft:sea_lantern`, `minecraft:shroomlight` or `minecraft:ochre_froglight` set into walls, ceilings or a base, or with lanterns and torches in "details".
+- Light it where it fits, with `minecraft:glowstone`, `minecraft:sea_lantern`, `minecraft:shroomlight` or `minecraft:ochre_froglight` set into walls, ceilings or a base, or with lanterns and torches in "details". Lights and glowing features (engines, lamps, eyes) sit recessed in a darker frame or housing, not as a bare block of bright colour.
 
 # WORKED EXAMPLE 1: A BUILDING
 
