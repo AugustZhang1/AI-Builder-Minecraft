@@ -1,0 +1,6 @@
+# Private local notes
+*.local.md
+
+.venv/
+__pycache__/
+*.pyc
