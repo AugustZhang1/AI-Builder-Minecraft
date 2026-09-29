@@ -153,6 +153,16 @@ def _union_bounds(meshes: dict[str, trimesh.Trimesh]) -> tuple[np.ndarray, np.nd
     )
 
 
+CONTAINS_CHUNK = 250_000  # points per mesh.contains call: caps memory on big builds, same result
+
+
+def _contains(mesh: trimesh.Trimesh, pts: np.ndarray) -> np.ndarray:
+    """mesh.contains(pts) as a bool array, asked CONTAINS_CHUNK points at a time."""
+    slices = range(0, len(pts), CONTAINS_CHUNK)
+    hits = [np.asarray(mesh.contains(pts[i : i + CONTAINS_CHUNK]), dtype=bool) for i in slices]
+    return np.concatenate(hits) if hits else np.zeros(0, dtype=bool)
+
+
 def voxelize(
     stls: dict[str, Path],
     blocks: dict[str, str],
@@ -213,16 +223,15 @@ def voxelize(
         ys = origin[1] + np.arange(j_min, j_max) + 0.5
         zs = origin[2] + np.arange(k_min, k_max) + 0.5
 
-        gx, gy, gz = np.meshgrid(xs, ys, zs, indexing="ij")
-        pts = np.stack([gx, gy, gz], axis=-1).reshape(-1, 3)
+        # Test the part's box a few z layers at a time, so the point cloud stays small.
+        layers = max(1, CONTAINS_CHUNK // (len(xs) * len(ys)))
+        for z0 in range(0, len(zs), layers):
+            gx, gy, gz = np.meshgrid(xs, ys, zs[z0 : z0 + layers], indexing="ij")
+            pts = np.stack([gx, gy, gz], axis=-1).reshape(-1, 3)
 
-        mask = np.asarray(mesh.contains(pts), dtype=bool)
-        if not np.any(mask):
-            continue
-
-        sub_mask = mask.reshape(len(xs), len(ys), len(zs))
-        idx_i, idx_j, idx_k = np.nonzero(sub_mask)
-        grid[i_min + idx_i, j_min + idx_j, k_min + idx_k] = val
+            sub_mask = _contains(mesh, pts).reshape(len(xs), len(ys), -1)
+            idx_i, idx_j, idx_k = np.nonzero(sub_mask)
+            grid[i_min + idx_i, j_min + idx_j, k_min + z0 + idx_k] = val
 
     grid = drop_floaters(grid)
     occupied = np.argwhere(grid > 0)
@@ -377,7 +386,7 @@ def smooth(
         lo, hi = meshes[part].bounds
         near = np.all((pts >= lo) & (pts <= hi), axis=1)
         if np.any(near):
-            hits[i, near] = np.asarray(meshes[part].contains(pts[near]), dtype=bool)
+            hits[i, near] = _contains(meshes[part], pts[near])
     hits = hits.reshape(len(parts), len(cells), 8)
     sampled = hits.any(axis=0)
 
