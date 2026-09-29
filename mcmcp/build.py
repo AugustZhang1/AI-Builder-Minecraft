@@ -104,22 +104,13 @@ def render_parts(scad_text: str, parts: list[str], build_dir: Path) -> dict[str,
     return stls
 
 
-def voxelize(
+def _load_meshes(
     stls: dict[str, Path],
     blocks: dict[str, str],
-    max_dims: int | tuple[int, int, int],
-) -> tuple[np.ndarray, list[str], np.ndarray, float]:
-    """Voxelize all parts into one shared grid of shape (X, Y, Z).
-    max_dims is an int (same limit on all 3 axes) or a tuple (wide_x, deep_y, tall_z).
-    Returns (grid, palette, offset, scale):
-    0 = air, i = palette[i], palette[0] == "minecraft:air".
-    offset: np.ndarray of 3 ints = design coordinate of grid[0,0,0] after trimming.
-    scale: float, 1.0 when not scaled."""
-    if isinstance(max_dims, (int, np.integer)):
-        limits = np.array([float(max_dims), float(max_dims), float(max_dims)])
-    else:
-        limits = np.array([float(d) for d in max_dims])
-
+    limits: np.ndarray,
+) -> tuple[dict[str, trimesh.Trimesh], float]:
+    """Load the mesh of every part in blocks that has a non-empty STL and, if the union is larger
+    than limits (wide_x, deep_y, tall_z), scale them all down to fit. Returns (part -> mesh, scale)."""
     loaded_meshes: dict[str, trimesh.Trimesh] = {}
     for part_name, block_id in blocks.items():
         if part_name in stls:
@@ -136,10 +127,7 @@ def voxelize(
     if not loaded_meshes:
         raise BuildError("No solid geometry to voxelize")
 
-    mins = np.array([m.bounds[0] for m in loaded_meshes.values()])
-    maxs = np.array([m.bounds[1] for m in loaded_meshes.values()])
-    union_min = np.min(mins, axis=0)
-    union_max = np.max(maxs, axis=0)
+    union_min, union_max = _union_bounds(loaded_meshes)
 
     # Measure from the grid origin (floor of the min corner) so the scaled design never
     # needs more than limit cells on any axis.
@@ -153,10 +141,36 @@ def voxelize(
             m.apply_translation(-grid_min)
             m.apply_scale(scale)
             m.apply_translation(grid_min)
-        mins = np.array([m.bounds[0] for m in loaded_meshes.values()])
-        maxs = np.array([m.bounds[1] for m in loaded_meshes.values()])
-        union_min = np.min(mins, axis=0)
-        union_max = np.max(maxs, axis=0)
+
+    return loaded_meshes, scale
+
+
+def _union_bounds(meshes: dict[str, trimesh.Trimesh]) -> tuple[np.ndarray, np.ndarray]:
+    """Min and max corner of all meshes together."""
+    return (
+        np.min([m.bounds[0] for m in meshes.values()], axis=0),
+        np.max([m.bounds[1] for m in meshes.values()], axis=0),
+    )
+
+
+def voxelize(
+    stls: dict[str, Path],
+    blocks: dict[str, str],
+    max_dims: int | tuple[int, int, int],
+) -> tuple[np.ndarray, list[str], np.ndarray, float]:
+    """Voxelize all parts into one shared grid of shape (X, Y, Z).
+    max_dims is an int (same limit on all 3 axes) or a tuple (wide_x, deep_y, tall_z).
+    Returns (grid, palette, offset, scale):
+    0 = air, i = palette[i], palette[0] == "minecraft:air".
+    offset: np.ndarray of 3 ints = design coordinate of grid[0,0,0] after trimming.
+    scale: float, 1.0 when not scaled."""
+    if isinstance(max_dims, (int, np.integer)):
+        limits = np.array([float(max_dims), float(max_dims), float(max_dims)])
+    else:
+        limits = np.array([float(d) for d in max_dims])
+
+    loaded_meshes, scale = _load_meshes(stls, blocks, limits)
+    union_min, union_max = _union_bounds(loaded_meshes)
 
     origin = np.floor(union_min).astype(int)
     max_bound = np.ceil(union_max).astype(int)
@@ -248,6 +262,153 @@ def drop_floaters(grid: np.ndarray) -> np.ndarray:
     out = grid.copy()
     out[drop[labels]] = 0
     return out
+
+
+@functools.cache
+def stair_slab_variants() -> dict[str, tuple[str | None, str | None]]:
+    """Full block id -> (slab id, stairs id) for the blocks that have at least one of them,
+    guessed from the ids in block_colors.json (stone_bricks -> stone_brick_slab, oak_planks -> oak_slab)."""
+    ids = set(_block_colors())
+    variants = {}
+    for block in ids - {"minecraft:bamboo", "minecraft:bamboo_block"}:  # the plant and the log, not the planks
+        stems = [block, block.removesuffix("s"), block.removesuffix("_planks"), block.removesuffix("_block")]
+        slab = next((f"{s}_slab" for s in stems if f"{s}_slab" in ids), None)
+        stairs = next((f"{s}_stairs" for s in stems if f"{s}_stairs" in ids), None)
+        if slab or stairs:
+            variants[block] = (slab, stairs)
+    return variants
+
+
+# The 8 sample points of a cell: sub-cell centres, index = 4 * ix + 2 * iy + iz (iz 0 = low half).
+_SAMPLES = np.array([(x, y, z) for x in (0.25, 0.75) for y in (0.25, 0.75) for z in (0.25, 0.75)])
+_LOW = _SAMPLES[:, 2] < 0.5
+_SIDES = {  # design space: north = +Y, south = -Y, east = +X, west = -X
+    "north": _SAMPLES[:, 1] > 0.5,
+    "south": _SAMPLES[:, 1] < 0.5,
+    "east": _SAMPLES[:, 0] > 0.5,
+    "west": _SAMPLES[:, 0] < 0.5,
+}
+# (is stairs, block state, samples the shape fills); slabs come first so they win ties.
+# Stairs facing F are a slab plus the other half on side F: they rise toward F.
+_SHAPES = [(False, "type=bottom", _LOW), (False, "type=top", ~_LOW)]
+for _half, _slab in (("bottom", _LOW), ("top", ~_LOW)):
+    _SHAPES += [(True, f"facing={f},half={_half}", _slab | side) for f, side in _SIDES.items()]
+_TEMPLATES = np.array([mask for _, _, mask in _SHAPES])
+_IS_STAIRS = np.array([stairs for stairs, _, _ in _SHAPES])
+
+
+def _neighbour_flags(solid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """(has a solid face neighbour, has an air face neighbour) per cell; outside the grid is air."""
+    near_solid = np.zeros_like(solid)
+    near_air = np.zeros_like(solid)
+    for axis in range(3):
+        lo = tuple(slice(None, -1) if a == axis else slice(None) for a in range(3))
+        hi = tuple(slice(1, None) if a == axis else slice(None) for a in range(3))
+        near_solid[lo] |= solid[hi]
+        near_solid[hi] |= solid[lo]
+        near_air[lo] |= ~solid[hi]
+        near_air[hi] |= ~solid[lo]
+        near_air[(slice(None),) * axis + (0,)] = True
+        near_air[(slice(None),) * axis + (-1,)] = True
+    return near_solid, near_air
+
+
+def _merge_runs(cells: np.ndarray, kinds: np.ndarray) -> list[tuple[int, int, int, int, int, int, int]]:
+    """Merge cells (n, 3) of the same kind that touch along one axis into (x1, y1, z1, x2, y2, z2, kind)
+    boxes, along whichever of the three axes gives the fewest boxes."""
+    best = None
+    for axis in range(3):
+        a, b = (c for c in range(3) if c != axis)
+        order = np.lexsort((cells[:, axis], cells[:, b], cells[:, a], kinds))
+        c, k = cells[order], kinds[order]
+        start = np.ones(len(c), dtype=bool)
+        start[1:] = (
+            (k[1:] != k[:-1]) | (c[1:, a] != c[:-1, a]) | (c[1:, b] != c[:-1, b]) | (c[1:, axis] != c[:-1, axis] + 1)
+        )
+        first = np.nonzero(start)[0]
+        if best is None or len(first) < len(best[1]):
+            best = (c, k, first)
+    c, k, first = best
+    last = np.append(first[1:], len(c)) - 1
+    return [(*map(int, c[i]), *map(int, c[j]), int(k[i])) for i, j in zip(first, last)]
+
+
+def smooth(
+    stls: dict[str, Path],
+    blocks: dict[str, str],
+    grid: np.ndarray,
+    palette: list[str],
+    offset: np.ndarray,
+    limits: int | tuple[int, int, int],
+) -> tuple[np.ndarray, list[tuple[int, int, int, int, int, int, str]]]:
+    """Turn cells on sloped or curved surfaces into stairs and slabs. offset and limits are voxelize's
+    (offset of grid[0,0,0] and the size limits, so the meshes are scaled the same way). Each solid
+    cell with an air neighbour and each air cell with a solid neighbour is sampled at its 8 sub-cell
+    centres and gets the slab or stairs that fits them best, if that is at most 1 sample off and
+    clearly better than what the cell is now. Blocks without slab or stairs variants stay as they are.
+    Returns (grid with the solid cells that became shapes set to air, boxes in grid coordinates with
+    states, e.g. "minecraft:stone_brick_stairs[facing=north,half=bottom]")."""
+    meshes, _ = _load_meshes(stls, blocks, np.asarray(limits, dtype=float))
+    parts = list(meshes)  # in blocks order: a later part overrides an earlier one
+    variants = stair_slab_variants()
+    none = (None, None)
+    pal_pairs = [variants.get(b.split("[", 1)[0], none) for b in palette]
+    part_pairs = [variants.get(blocks[p].split("[", 1)[0], none) for p in parts]
+    mats = list(dict.fromkeys(pal_pairs + part_pairs))  # distinct (slab, stairs) pairs
+    if all(m == none for m in mats):
+        return grid.copy(), []
+    pal_mat = np.array([mats.index(m) for m in pal_pairs])
+    part_mat = np.array([mats.index(m) for m in part_pairs])
+    slab_ok = np.array([m[0] is not None for m in mats])
+    stairs_ok = np.array([m[1] is not None for m in mats])
+
+    solid = grid > 0
+    near_solid, near_air = _neighbour_flags(solid)
+    has_variant = np.array([m != none for m in pal_pairs])
+    cand = (solid & near_air & has_variant[grid]) | (~solid & near_solid)
+    cells = np.argwhere(cand)
+    if len(cells) == 0:
+        return grid.copy(), []
+
+    # Sample the candidates against every part: rows are cells, columns the 8 samples.
+    pts = (np.asarray(offset) + cells[:, None, :] + _SAMPLES).reshape(-1, 3)
+    hits = np.zeros((len(parts), len(pts)), dtype=bool)
+    for i, part in enumerate(parts):
+        lo, hi = meshes[part].bounds
+        near = np.all((pts >= lo) & (pts <= hi), axis=1)
+        if np.any(near):
+            hits[i, near] = np.asarray(meshes[part].contains(pts[near]), dtype=bool)
+    hits = hits.reshape(len(parts), len(cells), 8)
+    sampled = hits.any(axis=0)
+
+    # Material: a solid cell's current block, else the part holding most samples (ties: later part).
+    was_solid = solid[tuple(cells.T)]
+    part_of = len(parts) - 1 - np.argmax(hits.sum(axis=2)[::-1], axis=0)
+    material = np.where(was_solid, pal_mat[grid[tuple(cells.T)]], part_mat[part_of])
+
+    # Best shape per cell, ruling out shapes the material has no block for.
+    dist = (sampled[:, None, :] != _TEMPLATES).sum(axis=2)
+    dist[~stairs_ok[material][:, None] & _IS_STAIRS] = 99
+    dist[~slab_ok[material][:, None] & ~_IS_STAIRS] = 99
+    best = dist.argmin(axis=1)
+    best_dist = dist.min(axis=1)
+    now = np.where(was_solid, 8 - sampled.sum(axis=1), sampled.sum(axis=1))  # distance of the cell as it is
+    change = (best_dist <= 1) & (best_dist < now)
+
+    out = grid.copy()
+    cells = cells[change]
+    out[tuple(cells[was_solid[change]].T)] = 0
+    if len(cells) == 0:
+        return out, []
+
+    # A "kind" is a (material, shape) pair; neighbouring cells of one kind become one box.
+    kinds = material[change] * len(_SHAPES) + best[change]
+    result = []
+    for x1, y1, z1, x2, y2, z2, kind in _merge_runs(cells, kinds):
+        slab, stairs = mats[kind // len(_SHAPES)]
+        is_stairs, state, _ = _SHAPES[kind % len(_SHAPES)]
+        result.append((x1, y1, z1, x2, y2, z2, f"{stairs if is_stairs else slab}[{state}]"))
+    return out, result
 
 
 MIX_MIN_BASE = 0.7  # the base block keeps at least this share of a mixed surface
@@ -521,6 +682,7 @@ def _block_colors() -> dict[str, list[int]]:
 
 def block_color(block_id: str) -> tuple[int, int, int]:
     """Average texture colour of a block (block_colors.json); unknown ids get a stable made-up colour."""
+    block_id = block_id.split("[", 1)[0]  # states don't change the colour
     rgb = _block_colors().get(block_id) or hashlib.md5(block_id.encode("utf-8")).digest()[:3]
     return (int(rgb[0]), int(rgb[1]), int(rgb[2]))
 
@@ -659,7 +821,9 @@ def stamp_details(
     palette: list[str],
     dboxes: list[tuple[int, int, int, int, int, int, str]],
 ) -> tuple[np.ndarray, list[str]]:
-    """Stamp detail boxes into a copy of grid, clipped to grid bounds. For previews only."""
+    """Stamp detail boxes into a copy of grid, clipped to grid bounds. For previews only.
+    Slabs and stairs keep their states in the palette so the preview can draw their shape;
+    every other block goes in by its base id."""
     new_grid = grid.copy()
     new_palette = list(palette)
     palette_map = {b: i for i, b in enumerate(new_palette)}
@@ -678,12 +842,13 @@ def stamp_details(
             continue
 
         base_id = block.split("[", 1)[0]
-        if base_id not in palette_map:
+        entry = block if base_id.endswith(("_slab", "_stairs")) else base_id
+        if entry not in palette_map:
             if len(new_palette) >= 256:
                 raise BuildError("Too many distinct block types (max 255)")
-            palette_map[base_id] = len(new_palette)
-            new_palette.append(base_id)
-        val = palette_map[base_id]
+            palette_map[entry] = len(new_palette)
+            new_palette.append(entry)
+        val = palette_map[entry]
 
         new_grid[cx1 : cx2 + 1, cy1 : cy2 + 1, cz1 : cz2 + 1] = val
 

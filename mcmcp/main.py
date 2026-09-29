@@ -19,7 +19,7 @@ import threading
 import time
 import urllib.request
 import zlib
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 from PIL import Image
@@ -59,6 +59,7 @@ HELP_LINES = (
     "!designai [claude|gemini] - shows or switches the AI",
     "!designanim [on|off] - shows or switches the builder crew animation",
     "!designreview [on|off] - shows or switches the AI's check of its own build",
+    "!designbest [on|off] - makes two designs, keeps the better one (about twice the AI usage)",
     "!designhelp - shows this list",
 )
 
@@ -105,6 +106,12 @@ def get_review() -> bool:
     return value if isinstance(value, bool) else config.REVIEW
 
 
+def get_best() -> bool:
+    """Whether !design makes two designs and keeps the better one (set with !designbest; default config.BEST)."""
+    value = load_settings().get("best")
+    return value if isinstance(value, bool) else config.BEST
+
+
 def _parse_word_command(message: str, word: str) -> tuple[bool, str | None]:
     """Parses `word [arg]` (case-insensitive). Returns (is_command, arg_or_None)."""
     msg = message.strip()
@@ -128,6 +135,11 @@ def parse_anim_command(message: str) -> tuple[bool, str | None]:
 def parse_review_command(message: str) -> tuple[bool, str | None]:
     """Parses a message for the !designreview command. Returns (is_command, arg_or_None)."""
     return _parse_word_command(message, "!designreview")
+
+
+def parse_best_command(message: str) -> tuple[bool, str | None]:
+    """Parses a message for the !designbest command. Returns (is_command, arg_or_None)."""
+    return _parse_word_command(message, "!designbest")
 
 
 def parse_place_command(message: str) -> bool:
@@ -376,9 +388,9 @@ def room_check_commands(
 
 
 def world_limits(origin_y: int, dim: str) -> tuple[int, int, int]:
-    """(wide, deep, tall) build limits from view distance and player feet height."""
-    reach = (config.view_distance() - 1) * 16 - config.GAP
-    wide = deep = reach
+    """(wide, deep, tall) build limits: MAX_SIDE across (the build's chunks are force-loaded
+    while it is placed) and from the player's feet to the top of the world."""
+    wide = deep = config.MAX_SIDE
     top = 319 if dim in ("minecraft:overworld", "overworld") else 255
     tall = top - origin_y
     if tall < 1:
@@ -703,13 +715,19 @@ def voxelize_design(
     limits: tuple[int, int, int],
     build_dir: Path,
 ) -> tuple[np.ndarray, list[str], list[tuple[int, int, int, int, int, int, str]], bool]:
-    """Voxelize, apply texture mixes, map details and save the previews.
+    """Voxelize, add stairs and slabs on slopes, apply texture mixes, map details and save the previews.
     Returns (grid, palette, dboxes, details_skipped); details are skipped if the design was scaled down."""
     grid, palette, offset, scale = build.voxelize(stls, blocks, limits)
+    shaped = []  # stairs and slabs, in grid coordinates; the AI's details go after them and win
+    if config.SMOOTH:
+        try:  # smoothing never fails a build
+            grid, shaped = build.smooth(stls, blocks, grid, palette, offset, limits)
+        except Exception as e:
+            logger.warning("Stairs and slabs skipped: %s", e)
     if mix:
         grid, palette = build.apply_mix(grid, palette, mix, zlib.crc32(scad.encode("utf-8")))
     skipped = scale < 1.0 and bool(details)
-    dboxes = [] if skipped else build.detail_boxes(details, offset, grid.shape)
+    dboxes = shaped + ([] if skipped else build.detail_boxes(details, offset, grid.shape))
 
     # Previews never fail a build.
     for name, make in (
@@ -723,6 +741,37 @@ def voxelize_design(
         except Exception as e:
             logger.warning("Failed to write %s: %s", name, e)
     return grid, palette, dboxes, skipped
+
+
+def save_design(
+    out_dir: Path,
+    raw: str,
+    scad: str,
+    blocks: dict[str, str],
+    mix: dict[str, dict[str, float]],
+    details: list[tuple[int, int, int, int, int, int, str]],
+) -> None:
+    """Writes response.txt, design.scad and blocks.json of a design to out_dir."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "response.txt").write_text(raw, encoding="utf-8")
+    (out_dir / "design.scad").write_text(scad, encoding="utf-8")
+    (out_dir / "blocks.json").write_text(
+        json.dumps({"blocks": blocks, "mix": mix, "details": details}, indent=2),
+        encoding="utf-8",
+    )
+
+
+def build_revision(
+    rev: tuple[str, dict[str, str], dict[str, dict[str, float]], list[tuple[int, int, int, int, int, int, str]], str],
+    limits: tuple[int, int, int],
+    out_dir: Path,
+) -> tuple[str, dict[str, str], dict[str, dict[str, float]], list[tuple[int, int, int, int, int, int, str]], np.ndarray, list[str], list[tuple[int, int, int, int, int, int, str]], bool]:
+    """Saves, renders and voxelizes a design (an llm.design/review/pick 5-tuple) in out_dir."""
+    scad, blocks, mix, details, raw = rev
+    save_design(out_dir, raw, scad, blocks, mix, details)
+    stls = build.render_parts(scad, list(blocks), out_dir)
+    grid, palette, dboxes, skipped = voxelize_design(scad, stls, blocks, mix, details, limits, out_dir)
+    return scad, blocks, mix, details, grid, palette, dboxes, skipped
 
 
 def review_design(
@@ -757,28 +806,195 @@ def review_design(
             send_fn("Review: kept the design.")
             return None
 
-        rev_scad, rev_blocks, rev_mix, rev_details, rev_raw = rev
-        review_dir = build_dir / "review"
-        review_dir.mkdir(parents=True, exist_ok=True)
-        (review_dir / "response.txt").write_text(rev_raw, encoding="utf-8")
-        (review_dir / "design.scad").write_text(rev_scad, encoding="utf-8")
-        (review_dir / "blocks.json").write_text(
-            json.dumps({"blocks": rev_blocks, "mix": rev_mix, "details": rev_details}, indent=2),
-            encoding="utf-8",
-        )
-        stls = build.render_parts(rev_scad, list(rev_blocks), review_dir)
-        grid, palette, dboxes, skipped = voxelize_design(
-            rev_scad, stls, rev_blocks, rev_mix, rev_details, limits, review_dir
-        )
+        result = build_revision(rev, limits, build_dir / "review")
         send_fn("Review: improved the design.")
-        return rev_scad, rev_blocks, rev_mix, rev_details, grid, palette, dboxes, skipped
+        return result
     except Exception as e:
         logger.warning("Review failed: %s", e)
         send_fn("Review failed; building the first design.")
         return None
 
 
+class Version(NamedTuple):
+    """One built design of a best-of-2 run."""
+
+    label: str  # "A" or "B"
+    dir: Path
+    raw: str
+    grid: np.ndarray
+    palette: list[str]
+    dboxes: list[tuple[int, int, int, int, int, int, str]]
+    skipped: bool
+
+
+def design_two(
+    description: str,
+    limits: tuple[int, int, int],
+    image_png: bytes | None,
+    provider: str,
+    send_fn: Callable[[str], Any],
+    provider_name: str,
+) -> list[Any]:
+    """Runs two llm.design calls at the same time, each in its own work folder. Only the first
+    narrates; the heartbeat runs until both are done. Returns [a, b]: a design 5-tuple, or the
+    exception if that design failed."""
+    heartbeat = Heartbeat(send_fn, provider_name, config.HEARTBEAT_SECONDS)
+    narrator = Narrator(send_fn)
+    results: list[Any] = [None, None]
+
+    def work(i: int) -> None:
+        try:
+            results[i] = llm.design(
+                description,
+                limits,
+                image_png=image_png,
+                on_text=narrator.feed if i == 0 else None,
+                provider=provider,
+                work_dir=llm._CLI_WORKDIR / "ab"[i],
+            )
+        except Exception as e:
+            results[i] = e
+
+    threads = [threading.Thread(target=work, args=(i,), daemon=True) for i in (0, 1)]
+    heartbeat.start()
+    try:
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    finally:
+        heartbeat.stop()
+    narrator.flush()
+    return results
+
+
+def build_versions(
+    results: list[Any],
+    limits: tuple[int, int, int],
+    build_dir: Path,
+    send_fn: Callable[[str], Any],
+) -> list[Version]:
+    """Renders and voxelizes the designs from design_two: A in build_dir, B in build_dir/b.
+    Returns the versions that worked; if none did, raises A's error."""
+    versions: list[Version] = []
+    failed: list[str] = []
+    first_error: Exception | None = None
+    for label, result in zip("AB", results):
+        if versions and STOP.is_set():
+            break  # !designstop: one version is enough
+        try:
+            if isinstance(result, Exception):
+                raise result
+            rev = build_revision(result, limits, build_dir if label == "A" else build_dir / "b")
+            versions.append(Version(label, build_dir if label == "A" else build_dir / "b", result[4], *rev[4:]))
+        except Exception as e:
+            logger.warning("Version %s failed: %s", label, e)
+            failed.append(label)
+            first_error = first_error or e
+    if not versions:
+        raise first_error or RuntimeError("No design")
+    if failed:
+        send_fn(f"Version {failed[0]} failed; using version {versions[0].label}.")
+    return versions
+
+
+def choose_version(
+    description: str,
+    limits: tuple[int, int, int],
+    image_png: bytes | None,
+    provider: str,
+    versions: list[Version],
+    build_dir: Path,
+    send_fn: Callable[[str], Any],
+    provider_name: str,
+) -> tuple[np.ndarray, list[str], list[tuple[int, int, int, int, int, int, str]], bool, str]:
+    """Asks the AI to pick the better of two versions (and fix it) instead of the review round.
+    With only one version (or after !designstop) that one goes through the normal review round.
+    If the pick fails, A is used. Returns (grid, palette, dboxes, skipped, note about the pick)."""
+    if len(versions) == 1 or STOP.is_set():
+        v = versions[0]
+        grid, palette, dboxes, skipped = v.grid, v.palette, v.dboxes, v.skipped
+        if get_review() and not STOP.is_set():
+            rev = review_design(description, limits, image_png, provider, v.raw, v.dir, send_fn, provider_name)
+            if rev is not None:
+                grid, palette, dboxes, skipped = rev[4:]
+        return grid, palette, dboxes, skipped, f"{v.label} (not compared)"
+
+    send_fn("Comparing the two versions...")
+    heartbeat = Heartbeat(send_fn, provider_name, config.HEARTBEAT_SECONDS)
+    heartbeat.start()
+    try:
+        index, revised = llm.pick(
+            description,
+            limits,
+            [(v.raw, (v.dir / "preview.png").read_bytes()) for v in versions],
+            image_png=image_png,
+            provider=provider,
+        )
+    except Exception as e:
+        logger.warning("Pick failed: %s", e)
+        v = versions[0]
+        send_fn("Picking failed; building version A.")
+        return v.grid, v.palette, v.dboxes, v.skipped, "A (the pick failed)"
+    finally:
+        heartbeat.stop()
+
+    v = versions[index]
+    if revised is not None:
+        try:
+            rev = build_revision(revised, limits, build_dir / "review")
+            send_fn(f"Picked version {v.label} and improved it.")
+            return (*rev[4:], f"{v.label} (improved)")
+        except Exception as e:
+            logger.warning("Improved version failed: %s", e)
+            send_fn(f"Picked version {v.label}; the improvement failed.")
+            return v.grid, v.palette, v.dboxes, v.skipped, f"{v.label} (the improvement failed)"
+    send_fn(f"Picked version {v.label}.")
+    return v.grid, v.palette, v.dboxes, v.skipped, v.label
+
+
+def forceload_commands(
+    dim: str,
+    action: str,
+    grid_shape: tuple[int, int, int],
+    origin: tuple[int, int, int],
+    facing: str,
+) -> list[str]:
+    """'forceload add/remove' commands for every chunk under the build and its scaffolding ring,
+    one command per chunk row (the game allows 256 chunks per command)."""
+    sx, sy, _ = grid_shape
+    x1, _, z1, x2, _, z2 = build.box_to_world((-1, -1, 0, sx, sy, 0, 0), sx, origin, facing, config.GAP)
+    cx1, cx2 = min(x1, x2) // 16, max(x1, x2) // 16
+    cz1, cz2 = min(z1, z2) // 16, max(z1, z2) // 16
+    return [
+        f"execute in {dim} run forceload {action} {cx1 * 16} {cz * 16} {cx2 * 16} {cz * 16}"
+        for cz in range(cz1, cz2 + 1)
+    ]
+
+
 def place_design(
+    rcon: Rcon,
+    player: str,
+    design: tuple[np.ndarray, list[str], list[tuple[int, int, int, int, int, int, str]]],
+    origin: tuple[int, int, int],
+    facing: str,
+    dim: str,
+    start_time: float,
+    crew: animate.Crew | None = None,
+) -> None:
+    """Force-loads the build's chunks (so it can be bigger than the render distance), places it,
+    and always releases the chunks again."""
+    shape = design[0].shape
+    for cmd in forceload_commands(dim, "add", shape, origin, facing):
+        rcon.command(cmd)
+    try:
+        _place_loaded(rcon, player, design, origin, facing, dim, start_time, crew)
+    finally:
+        for cmd in forceload_commands(dim, "remove", shape, origin, facing):
+            rcon.command(cmd)
+
+
+def _place_loaded(
     rcon: Rcon,
     player: str,
     design: tuple[np.ndarray, list[str], list[tuple[int, int, int, int, int, int, str]]],
@@ -798,11 +1014,16 @@ def place_design(
     rboxes = room_boxes(grid, dboxes)
     world_boxes = [build.box_to_world(b, grid.shape[0], origin, facing, config.GAP) for b in rboxes]
     status = check_room(rcon, dim, world_boxes)
+    for _ in range(30):  # force-loaded chunks may take a moment to load or generate
+        if status != "not_loaded":
+            break
+        time.sleep(1)
+        status = check_room(rcon, dim, world_boxes)
     if status == "not_loaded":
         send_message(
             rcon,
             player,
-            "Part of the build is too far away to load. Stand nearer the middle of the area, or raise your render distance, then type !place.",
+            "Part of the build area didn't load in time. Type !place to try again.",
         )
         return
     elif status == "blocked":
@@ -924,8 +1145,10 @@ def run_build(
     scad_override: str | None = None,
     blocks_override: Any = None,
     ai: str | None = None,
+    best: bool | None = None,
 ) -> None:
-    """Executes the full in-game design and build pipeline."""
+    """Executes the full in-game design and build pipeline.
+    best: two designs and the AI keeps the better one (default: the !designbest setting)."""
     STOP.clear()
     start_time = time.time()
     crew: animate.Crew | None = None
@@ -971,10 +1194,13 @@ def run_build(
         # 4. Designing announcement and image download
         provider = (ai.lower() if ai else None) or get_provider()
         provider_name = PROVIDER_NAMES.get(provider, provider.capitalize())
+        overridden = scad_override is not None and blocks_override is not None
+        best = (get_best() if best is None else best) and not overridden
         send_message(
             rcon,
             player,
-            f"Designing with {provider_name} (up to {w}x{d}x{t}). This takes a few minutes...",
+            f"Designing {'two versions ' if best else ''}with {provider_name} (up to {w}x{d}x{t}). "
+            "This takes a few minutes...",
         )
         image_png: bytes | None = None
         if image_url:
@@ -986,12 +1212,15 @@ def run_build(
                 return
 
         # 5. LLM design or override
-        if scad_override is not None and blocks_override is not None:
+        send_fn = lambda msg: send_message(rcon, player, msg)
+        results: list[Any] = []
+        if overridden:
             scad = scad_override
             blocks, mix, details = load_blocks_data(blocks_override)
             raw = "// OpenSCAD design and blocks provided via flags\n"
+        elif best:
+            results = design_two(description, limits, image_png, provider, send_fn, provider_name)
         else:
-            send_fn = lambda msg: send_message(rcon, player, msg)
             heartbeat = Heartbeat(send_fn, provider_name, config.HEARTBEAT_SECONDS)
             narrator = Narrator(send_fn, on_first=heartbeat.stop)
             heartbeat.start()
@@ -1017,31 +1246,35 @@ def run_build(
             f"Player: {player}\nProvider: {provider}\nLimits: {w}x{d}x{t}\nImage: {image_url or ''}\nDescription: {description}\n",
             encoding="utf-8",
         )
-        (build_dir / "response.txt").write_text(raw, encoding="utf-8")
-        (build_dir / "design.scad").write_text(scad, encoding="utf-8")
-        (build_dir / "blocks.json").write_text(
-            json.dumps({"blocks": blocks, "mix": mix, "details": details}, indent=2),
-            encoding="utf-8",
-        )
 
         # 6. Rendering and voxelizing once with world limits
-        send_message(rcon, player, "Rendering...")
-        stls = build.render_parts(scad, list(blocks), build_dir)
-        grid, palette, dboxes, skipped = voxelize_design(scad, stls, blocks, mix, details, limits, build_dir)
-
-        if get_review() and (scad_override is None or blocks_override is None) and not STOP.is_set():
-            rev = review_design(
-                description,
-                limits,
-                image_png,
-                provider,
-                raw,
-                build_dir,
-                lambda msg: send_message(rcon, player, msg),
-                provider_name,
+        if best:
+            send_message(rcon, player, "Rendering...")
+            versions = build_versions(results, limits, build_dir, send_fn)
+            grid, palette, dboxes, skipped, note = choose_version(
+                description, limits, image_png, provider, versions, build_dir, send_fn, provider_name
             )
-            if rev is not None:
-                scad, blocks, mix, details, grid, palette, dboxes, skipped = rev
+            with (build_dir / "request.txt").open("a", encoding="utf-8") as f:
+                f.write(f"Picked: {note}\n")
+        else:
+            save_design(build_dir, raw, scad, blocks, mix, details)
+            send_message(rcon, player, "Rendering...")
+            stls = build.render_parts(scad, list(blocks), build_dir)
+            grid, palette, dboxes, skipped = voxelize_design(scad, stls, blocks, mix, details, limits, build_dir)
+
+            if get_review() and not overridden and not STOP.is_set():
+                rev = review_design(
+                    description,
+                    limits,
+                    image_png,
+                    provider,
+                    raw,
+                    build_dir,
+                    send_fn,
+                    provider_name,
+                )
+                if rev is not None:
+                    scad, blocks, mix, details, grid, palette, dboxes, skipped = rev
 
         if skipped:
             send_message(rcon, player, "Scaled the design down to fit; skipped the detail blocks.")
@@ -1074,10 +1307,12 @@ def run_offline_build(
     scad_file: str | None = None,
     blocks_file: str | None = None,
     ai: str | None = None,
+    best: bool = False,
 ) -> None:
-    """Executes design, rendering, voxelization, and previews without RCON, printing results and timings."""
+    """Executes design, rendering, voxelization, and previews without RCON, printing results and timings.
+    best: two designs at the same time and the AI keeps the better one."""
     t_total_start = time.time()
-    reach = (config.view_distance() - 1) * 16 - config.GAP
+    reach = config.MAX_SIDE
     if size is None:
         size = reach
     limits = (size, size, size)
@@ -1087,12 +1322,18 @@ def run_offline_build(
         image_png = load_image_png(image_url)
 
     provider = ai.lower() if ai else "gemini"
+    provider_name = PROVIDER_NAMES.get(provider, provider.capitalize())
+    best = best and not (scad_file and blocks_file)
     if scad_file and blocks_file:
         scad = Path(scad_file).read_text(encoding="utf-8")
         blocks_data = json.loads(Path(blocks_file).read_text(encoding="utf-8"))
         blocks, mix, details = load_blocks_data(blocks_data)
         raw = ""
         t_design = 0.0
+    elif best:
+        t0 = time.time()
+        results = design_two(description, limits, image_png, provider, print, provider_name)
+        t_design = time.time() - t0
     else:
         t0 = time.time()
         scad, blocks, mix, details, raw = llm.design(
@@ -1105,40 +1346,49 @@ def run_offline_build(
 
     build_dir = config.WORK_DIR / f"offline-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     build_dir.mkdir(parents=True, exist_ok=True)
-    (build_dir / "blocks.json").write_text(
-        json.dumps({"blocks": blocks, "mix": mix, "details": details}, indent=2),
-        encoding="utf-8",
-    )
-    if raw:
-        (build_dir / "response.txt").write_text(raw, encoding="utf-8")
-
-    t0 = time.time()
-    stls = build.render_parts(scad, list(blocks), build_dir)
-    t_render = time.time() - t0
-
-    t0 = time.time()
-    grid, palette, dboxes, skipped = voxelize_design(scad, stls, blocks, mix, details, limits, build_dir)
-    t_vox = time.time() - t0
-
-    t_review = 0.0
+    t_vox = t_review = 0.0
     reviewed = False
-    if get_review() and not (scad_file and blocks_file):
-        provider_name = PROVIDER_NAMES.get(provider, provider.capitalize())
+    if best:
         t0 = time.time()
-        rev = review_design(
-            description,
-            limits,
-            image_png,
-            provider,
-            raw,
-            build_dir,
-            print,
-            provider_name,
+        versions = build_versions(results, limits, build_dir, print)
+        t_render = time.time() - t0
+        t0 = time.time()
+        grid, palette, dboxes, skipped, note = choose_version(
+            description, limits, image_png, provider, versions, build_dir, print, provider_name
         )
         t_review = time.time() - t0
-        if rev is not None:
-            reviewed = True
-            scad, blocks, mix, details, grid, palette, dboxes, skipped = rev
+    else:
+        (build_dir / "blocks.json").write_text(
+            json.dumps({"blocks": blocks, "mix": mix, "details": details}, indent=2),
+            encoding="utf-8",
+        )
+        if raw:
+            (build_dir / "response.txt").write_text(raw, encoding="utf-8")
+
+        t0 = time.time()
+        stls = build.render_parts(scad, list(blocks), build_dir)
+        t_render = time.time() - t0
+
+        t0 = time.time()
+        grid, palette, dboxes, skipped = voxelize_design(scad, stls, blocks, mix, details, limits, build_dir)
+        t_vox = time.time() - t0
+
+        if get_review() and not (scad_file and blocks_file):
+            t0 = time.time()
+            rev = review_design(
+                description,
+                limits,
+                image_png,
+                provider,
+                raw,
+                build_dir,
+                print,
+                provider_name,
+            )
+            t_review = time.time() - t0
+            if rev is not None:
+                reviewed = True
+                scad, blocks, mix, details, grid, palette, dboxes, skipped = rev
 
     t_total = time.time() - t_total_start
     total_blocks = int(np.count_nonzero(grid)) + detail_block_count(dboxes)
@@ -1150,12 +1400,18 @@ def run_offline_build(
     print(f"Folder: {build_dir}")
     if reviewed:
         print(f"Review folder: {build_dir / 'review'}")
+    if best:
+        print(f"Picked: {note}")
     print("Timings:")
     print(f"  Design:   {t_design:.2f}s")
-    print(f"  Render:   {t_render:.2f}s")
-    print(f"  Voxelize + previews: {t_vox:.2f}s")
-    if get_review() and not (scad_file and blocks_file):
-        print(f"  Review:   {t_review:.2f}s")
+    if best:
+        print(f"  Render + voxelize (A and B): {t_render:.2f}s")
+        print(f"  Pick:     {t_review:.2f}s")
+    else:
+        print(f"  Render:   {t_render:.2f}s")
+        print(f"  Voxelize + previews: {t_vox:.2f}s")
+        if get_review() and not (scad_file and blocks_file):
+            print(f"  Review:   {t_review:.2f}s")
     print(f"  Total:    {t_total:.2f}s")
 
 
@@ -1466,6 +1722,20 @@ def handle_chat_line(
             send_message(rcon, player, "Usage: !designreview on|off")
         return
 
+    is_best_cmd, best_arg = parse_best_command(message)
+    if is_best_cmd:
+        if not is_op(player, config.OPS_FILE):
+            send_message(rcon, player, "Only ops can use !designbest.")
+            return
+        if best_arg is None:
+            send_message(rcon, player, f"Best of 2 designs: {'on' if get_best() else 'off'}.")
+        elif best_arg.lower() in ("on", "off"):
+            save_setting("best", best_arg.lower() == "on")
+            send_message(rcon, player, f"Best of 2 designs turned {best_arg.lower()}.")
+        else:
+            send_message(rcon, player, "Usage: !designbest on|off")
+        return
+
     if parse_stop_command(message):
         if not is_op(player, config.OPS_FILE):
             send_message(rcon, player, "Only ops can use !designstop.")
@@ -1599,7 +1869,7 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-    default_reach = (config.view_distance() - 1) * 16 - config.GAP
+    default_reach = config.MAX_SIDE
     parser = argparse.ArgumentParser(description="Minecraft MCP v2 builder")
     parser.add_argument("--once", type=str, default=None, help="Run one build and exit")
     parser.add_argument("--player", type=str, default=None, help="Player name for position and messages")
@@ -1613,6 +1883,11 @@ def main() -> None:
         choices=["claude", "gemini"],
         default=None,
         help="AI provider override for this run (offline runs default to gemini)",
+    )
+    parser.add_argument(
+        "--best",
+        action="store_true",
+        help="Make two designs and keep the better one (about twice the AI usage); default: the !designbest setting with --player, off otherwise",
     )
     parser.add_argument("--pixelart", type=str, default=None, help="Image URL or file path for pixel art")
     parser.add_argument("--width", type=int, default=None, help="Width for pixel art")
@@ -1647,6 +1922,7 @@ def main() -> None:
                 scad_override=scad_override,
                 blocks_override=blocks_override,
                 ai=args.ai,
+                best=True if args.best else None,
             )
         else:
             run_offline_build(
@@ -1656,6 +1932,7 @@ def main() -> None:
                 scad_file=args.scad,
                 blocks_file=args.blocks,
                 ai=args.ai,
+                best=args.best,
             )
         return
 

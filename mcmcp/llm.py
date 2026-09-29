@@ -38,6 +38,7 @@ BLOCK_ID_RE = re.compile(r"^minecraft:[a-z0-9_]+$")
 DETAIL_RE = re.compile(r"^minecraft:[a-z0-9_]+(\[[a-z0-9_]+=[a-z0-9_]+(,[a-z0-9_]+=[a-z0-9_]+)*\])?$")
 FENCE_RE = re.compile(r"```([a-zA-Z0-9_-]*)[^\S\r\n]*\r?\n([\s\S]*?)```")
 KEEP_RE = re.compile(r"\bKEEP\b")  # the exact word the review asks for
+PICK_RE = re.compile(r"\b(?i:pick):?\s+\**([AB])\b")  # "PICK A" or "PICK B" (the letter in capitals)
 
 
 def _limits_line(limits: tuple[int, int, int] | int) -> str:
@@ -96,7 +97,8 @@ def _cli_command(prompt_file: Path | str | None = None) -> list[str]:
 GEMINI_RULES = (
     "Do not use any tools, except to read the files named below. "
     "Do not create or edit files. Reply only with the two fenced blocks described above, "
-    "or with KEEP when asked to review."
+    "or with KEEP when asked to review, or with PICK A or PICK B (then the corrected design, "
+    "if it needs one) when asked to pick."
 )
 
 REVIEW_TEXT = (
@@ -113,14 +115,29 @@ REVIEW_TEXT = (
 )
 
 
+PICK_TEXT = (
+    "Two designs were built from this request: design A and design B. "
+    "The images are previews of the results as blocks, A first and then B: "
+    "each has two angled views, then front, side and top views (the player sees the front). "
+    "Pick the one that best matches the request (and the reference image, if any): "
+    "the subject's silhouette, proportions and signature features, nothing broken or floating, "
+    "no large flat single-colour areas. "
+    "Reply with exactly PICK A or PICK B on the first line. "
+    "If the design you picked has clear problems, follow with the complete corrected design "
+    "in the same two fenced blocks (same rules and limits), keeping everything that already works. "
+    "Otherwise reply with only the PICK line."
+)
+
+
 def _build_gemini_user_text(
     description: str,
     limits: tuple[int, int, int] | int,
     image_png: bytes | None = None,
-    ref_path: Path | None = None,
     review: tuple[str, bytes] | None = None,
-    preview_path: Path | None = None,
+    pick: tuple[tuple[str, bytes], tuple[str, bytes]] | None = None,
+    work_dir: Path | None = None,
 ) -> str:
+    work = (work_dir or _CLI_WORKDIR).resolve()
     desc = description.strip() if description else ""
     limits_line = _limits_line(limits)
     if image_png and not desc:
@@ -129,17 +146,21 @@ def _build_gemini_user_text(
         user_text = f"Design: {desc}\n{limits_line}"
 
     if image_png:
-        target_path = (ref_path or (_CLI_WORKDIR / "ref.png")).resolve()
-        user_text += f"\nThe reference image is the file {target_path}. Look at it first."
+        user_text += f"\nThe reference image is the file {work / 'ref.png'}. Look at it first."
 
+    # Designs go in files: on the command line they can pass Windows' length limit.
     if review:
-        # The design goes in a file: on the command line it can pass Windows' length limit.
-        design_file = (_CLI_WORKDIR / "design.txt").resolve()
-        target_preview = (preview_path or (_CLI_WORKDIR / "preview.png")).resolve()
         user_text += (
-            f"\n\nYour design is the file {design_file}."
-            f"\nThe preview image is the file {target_preview}. Look at both first."
+            f"\n\nYour design is the file {work / 'design.txt'}."
+            f"\nThe preview image is the file {work / 'preview.png'}. Look at both first."
             f"\n\n{REVIEW_TEXT}"
+        )
+    if pick:
+        user_text += (
+            f"\n\nDesign A is the file {work / 'design_a.txt'}, its preview image is the file {work / 'preview_a.png'}."
+            f"\nDesign B is the file {work / 'design_b.txt'}, its preview image is the file {work / 'preview_b.png'}."
+            f"\nLook at all four first."
+            f"\n\n{PICK_TEXT}"
         )
     return user_text
 
@@ -148,15 +169,13 @@ def _build_gemini_prompt(
     description: str,
     limits: tuple[int, int, int] | int,
     image_png: bytes | None = None,
-    ref_file: Path | None = None,
     review: tuple[str, bytes] | None = None,
-    preview_file: Path | None = None,
+    pick: tuple[tuple[str, bytes], tuple[str, bytes]] | None = None,
+    work_dir: Path | None = None,
 ) -> str:
     system_prompt = _prepare_prompt_text().rstrip()
-    ref_path = (ref_file or (_CLI_WORKDIR / "ref.png")).resolve()
-    prev_path = (preview_file or (_CLI_WORKDIR / "preview.png")).resolve()
     user_text = _build_gemini_user_text(
-        description, limits, image_png, ref_path=ref_path, review=review, preview_path=prev_path
+        description, limits, image_png, review=review, pick=pick, work_dir=work_dir
     )
     return f"{system_prompt}\n\n{GEMINI_RULES}\n\n{user_text}"
 
@@ -176,11 +195,24 @@ def _agy_command(prompt_text: str) -> list[str]:
     return cmd
 
 
+def _image_part(png: bytes) -> dict[str, Any]:
+    """An image block of the stream-json message."""
+    return {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": "image/png",
+            "data": base64.b64encode(png).decode("ascii"),
+        },
+    }
+
+
 def _build_stdin_payload(
     description: str,
     limits: tuple[int, int, int] | int,
     image_png: bytes | None = None,
     review: tuple[str, bytes] | None = None,
+    pick: tuple[tuple[str, bytes], tuple[str, bytes]] | None = None,
 ) -> str:
     """Formats the single stream-json line for stdin."""
     desc = description.strip() if description else ""
@@ -192,14 +224,7 @@ def _build_stdin_payload(
 
     content: list[dict[str, Any]] = []
     if image_png:
-        content.append({
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": "image/png",
-                "data": base64.b64encode(image_png).decode("ascii"),
-            },
-        })
+        content.append(_image_part(image_png))
     content.append({
         "type": "text",
         "text": user_text,
@@ -211,18 +236,19 @@ def _build_stdin_payload(
             "type": "text",
             "text": f"Your design:\n{raw}",
         })
-        content.append({
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": "image/png",
-                "data": base64.b64encode(preview_png).decode("ascii"),
-            },
-        })
+        content.append(_image_part(preview_png))
         content.append({
             "type": "text",
             "text": REVIEW_TEXT,
         })
+
+    if pick:
+        for label, (raw, _) in zip("AB", pick):
+            content.append({"type": "text", "text": f"Design {label}:\n{raw}"})
+        for label, (_, preview_png) in zip("AB", pick):
+            content.append({"type": "text", "text": f"Preview of design {label}:"})
+            content.append(_image_part(preview_png))
+        content.append({"type": "text", "text": PICK_TEXT})
 
     msg = {
         "type": "user",
@@ -309,39 +335,43 @@ def _cli_text(
     timeout: float = config.CLAUDE_TIMEOUT,
     provider: str = "claude",
     review: tuple[str, bytes] | None = None,
+    work_dir: Path | None = None,
+    pick: tuple[tuple[str, bytes], tuple[str, bytes]] | None = None,
 ) -> Iterator[str]:
-    """Runs the Claude or Gemini CLI and yields text chunks synchronously."""
+    """Runs the Claude or Gemini CLI and yields text chunks synchronously.
+    work_dir is the folder for its files (default _CLI_WORKDIR); calls that run at the same
+    time need different ones."""
     if provider not in config.PROVIDERS:
         raise LlmError(f"Unknown provider: {provider!r}. Must be one of {config.PROVIDERS}")
 
-    _CLI_WORKDIR.mkdir(parents=True, exist_ok=True)
+    work = work_dir or _CLI_WORKDIR
+    work.mkdir(parents=True, exist_ok=True)
 
     if provider == "claude":
-        prompt_file = _prepare_prompt_file(_CLI_WORKDIR)
+        prompt_file = _prepare_prompt_file(work)
         cmd = _cli_command(prompt_file)
         stdin_payload: str | None = _build_stdin_payload(
-            description, limits, image_png=image_png, review=review
+            description, limits, image_png=image_png, review=review, pick=pick
         )
         stdin_mode = subprocess.PIPE
         delta_fn = _cli_delta
         cli_name = "claude"
     elif provider == "gemini":
-        ref_file = _CLI_WORKDIR / "ref.png"
+        ref_file = work / "ref.png"
         ref_file.unlink(missing_ok=True)
         if image_png:
             ref_file.write_bytes(image_png)
-        preview_file = _CLI_WORKDIR / "preview.png"
+        preview_file = work / "preview.png"
         preview_file.unlink(missing_ok=True)
         if review:
-            (_CLI_WORKDIR / "design.txt").write_text(review[0], encoding="utf-8")
+            (work / "design.txt").write_text(review[0], encoding="utf-8")
             preview_file.write_bytes(review[1])
+        if pick:
+            for label, (raw, preview_png) in zip("ab", pick):
+                (work / f"design_{label}.txt").write_text(raw, encoding="utf-8")
+                (work / f"preview_{label}.png").write_bytes(preview_png)
         prompt_text = _build_gemini_prompt(
-            description,
-            limits,
-            image_png,
-            ref_file=ref_file,
-            review=review,
-            preview_file=preview_file,
+            description, limits, image_png, review=review, pick=pick, work_dir=work
         )
         cmd = _agy_command(prompt_text)
         stdin_payload = None
@@ -356,7 +386,7 @@ def _cli_text(
     env.pop("ANTHROPIC_AUTH_TOKEN", None)
 
     popen_kwargs: dict[str, Any] = {
-        "cwd": _CLI_WORKDIR,
+        "cwd": work,
         "env": env,
         "stdin": stdin_mode,
         "stdout": subprocess.PIPE,
@@ -611,12 +641,15 @@ def design(
     image_png: bytes | None = None,
     on_text: Callable[[str], None] | None = None,
     provider: str = "claude",
+    work_dir: Path | None = None,
 ) -> tuple[str, dict[str, str], dict[str, dict[str, float]], list[tuple[int, int, int, int, int, int, str]], str]:
     """Returns (scad_text, blocks, mix, details, raw_response).
-    blocks maps part name -> block id, in precedence order (later parts override earlier ones)."""
+    blocks maps part name -> block id, in precedence order (later parts override earlier ones).
+    work_dir: see _cli_text (default: the shared folder)."""
     if provider not in config.PROVIDERS:
         raise LlmError(f"Unknown provider: {provider!r}. Must be one of {config.PROVIDERS}")
 
+    extra: dict[str, Any] = {"work_dir": work_dir} if work_dir is not None else {}
     try:
         chunks: list[str] = []
         for chunk in _cli_text(
@@ -625,6 +658,7 @@ def design(
             image_png=image_png,
             timeout=config.CLAUDE_TIMEOUT,
             provider=provider,
+            **extra,
         ):
             chunks.append(chunk)
             if on_text:
@@ -638,6 +672,16 @@ def design(
         raise LlmError(f"Design failed: {exc}") from exc
 
 
+def _thumbnail(png: bytes) -> bytes:
+    """A preview image scaled down to config.IMAGE_MAX_SIDE, as PNG."""
+    with Image.open(io.BytesIO(png)) as img:
+        img = img.convert("RGB")
+        img.thumbnail((config.IMAGE_MAX_SIDE, config.IMAGE_MAX_SIDE))
+        out = io.BytesIO()
+        img.save(out, format="PNG")
+        return out.getvalue()
+
+
 def review(
     description: str,
     limits: tuple[int, int, int] | int,
@@ -646,18 +690,14 @@ def review(
     image_png: bytes | None = None,
     provider: str = "claude",
     on_text: Callable[[str], None] | None = None,
+    work_dir: Path | None = None,
 ) -> tuple[str, dict[str, str], dict[str, dict[str, float]], list[tuple[int, int, int, int, int, int, str]], str] | None:
     """Reviews the build preview and either returns None (KEEP) or a corrected design 5-tuple."""
     if provider not in config.PROVIDERS:
         raise LlmError(f"Unknown provider: {provider!r}. Must be one of {config.PROVIDERS}")
 
     try:
-        with Image.open(io.BytesIO(preview_png)) as img:
-            img = img.convert("RGB")
-            img.thumbnail((config.IMAGE_MAX_SIDE, config.IMAGE_MAX_SIDE))
-            out = io.BytesIO()
-            img.save(out, format="PNG")
-            thumb_png = out.getvalue()
+        thumb_png = _thumbnail(preview_png)
 
         chunks: list[str] = []
         for chunk in _cli_text(
@@ -667,6 +707,7 @@ def review(
             timeout=config.CLAUDE_TIMEOUT,
             provider=provider,
             review=(raw, thumb_png),
+            work_dir=work_dir,
         ):
             chunks.append(chunk)
             if on_text:
@@ -680,3 +721,45 @@ def review(
         raise
     except Exception as exc:
         raise LlmError(f"Review failed: {exc}") from exc
+
+
+def pick(
+    description: str,
+    limits: tuple[int, int, int] | int,
+    designs: list[tuple[str, bytes]],
+    image_png: bytes | None = None,
+    provider: str = "claude",
+    work_dir: Path | None = None,
+) -> tuple[int, tuple[str, dict[str, str], dict[str, dict[str, float]], list[tuple[int, int, int, int, int, int, str]], str] | None]:
+    """Picks the better of two built designs. designs is [(raw_a, preview_png_a), (raw_b, preview_png_b)].
+    Returns (index, revised): index 0 (A) or 1 (B), revised None or the picked design's corrected
+    design 5-tuple like review returns. A reply without PICK A / PICK B raises LlmError."""
+    if provider not in config.PROVIDERS:
+        raise LlmError(f"Unknown provider: {provider!r}. Must be one of {config.PROVIDERS}")
+
+    try:
+        thumbs = tuple((raw, _thumbnail(preview_png)) for raw, preview_png in designs)
+        reply = "".join(_cli_text(
+            description,
+            limits,
+            image_png=image_png,
+            timeout=config.CLAUDE_TIMEOUT,
+            provider=provider,
+            work_dir=work_dir,
+            pick=thumbs,
+        ))
+        m = PICK_RE.search(FENCE_RE.sub("", reply))  # not inside a design's code
+        if m is None:
+            raise LlmError("No PICK A or PICK B in the reply")
+        index = "AB".index(m.group(1))
+        if "```" not in reply:
+            return index, None
+        try:
+            return index, parse_reply(reply) + (reply,)
+        except LlmError as exc:
+            logger.warning("Ignoring the corrected design of the pick: %s", exc)
+            return index, None
+    except LlmError:
+        raise
+    except Exception as exc:
+        raise LlmError(f"Pick failed: {exc}") from exc

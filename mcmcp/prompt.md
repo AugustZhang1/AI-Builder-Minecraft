@@ -44,7 +44,7 @@ Think this through before writing code:
 - At top level, instantiate each part:
   if (part == "all" || part == "<name>") <name>();
 - Every feature must be at least 1 unit thick; anything thinner vanishes when turned into blocks. A 1-unit feature must also sit exactly between whole numbers (x from 0 to 1, not from -0.5 to 0.5), or it vanishes too.
-- Straight walls, floors and openings sit on integer coordinates. Round, sloped and tapering forms (towers, domes, arches, hulls, bodies, limbs) are cylinders, cones, spheres and `hull()` on buildings too, not stepped stacks of boxes (pitched roofs may step, with stairs on the edges); curved walls and sculpted features are at least 2 units thick.
+- Straight walls, floors and openings sit on integer coordinates. Round, sloped and tapering forms (towers, domes, arches, hulls, wings, bodies, limbs) are made with the SHAPE TOOLS on buildings too, not stepped stacks of boxes (pitched roofs may step, with stairs on the edges); curved walls and sculpted features are at least 2 units thick.
 - Buildings: walls, floors and roofs at least 1 unit thick; interiors hollow; openings (doors, windows, rooms) are empty space made with `difference()`. Hollow a curved or sloped form by subtracting a smaller copy of the same shape, offset inward, so no room breaks through the outside.
 - Sculptures: solid shapes, no interior, no doors, windows or roof unless the description asks for them.
 - Parts may overlap. Later parts in the JSON "blocks" dictionary override earlier ones (e.g. list "glass", "trim", and "light" after "walls").
@@ -55,7 +55,17 @@ Think this through before writing code:
 - Constraints:
   - NO `import`, `include`, `use`, or `surface`.
   - `$fn` at most 48 (use 32-48 for large curved shapes so they come out smooth).
-  - No `minkowski()`. `hull()` only over a few small primitives (e.g. two spheres for a limb).
+  - No `minkowski()`. `hull()` over a handful of shapes at a time.
+
+# SHAPE TOOLS
+Pick the tool that fits the shape. Stacked boxes are only right for straight walls, floors and plates.
+- Spheres, scaled spheres, cylinders and cones: heads, bodies, domes, round towers, spires.
+- `hull()` of a few shapes makes one solid that tapers between them: a wedge or ship hull (hull of thin plates at the bow, middle and stern), a snout, a limb (two spheres). For a curving tail, neck, tentacle, branch or chain of any length, hull each neighbouring pair of points along a path:
+  `for (i = [0 : len(P) - 2]) hull() { translate(P[i]) sphere(R[i]); translate(P[i + 1]) sphere(R[i + 1]); }`
+- `linear_extrude(height = h, scale = s) polygon(points)` gives any flat outline a thickness (along +Z; rotate it into place): wings and fins with a scalloped edge, a wedge seen from above, a gable roof (a triangle extruded along the ridge), an L-, cross- or star-shaped footprint, an arch to subtract for a doorway. A `scale` below 1 tapers it toward the top.
+- `rotate_extrude() polygon(profile)` spins a side profile around the Z axis (profile x = radius, never negative; y = height): anything round whose width changes with height, such as a tower with a flared base and a balcony, an onion dome, a lighthouse, a column with base and capital, a fountain, a bell, the underside of a floating island. `rotate_extrude(angle = a)` makes part of a ring (a curved wall, an arch).
+- Natural forms (rock, cliffs, mountains, islands, trees, clouds) are irregular: several overlapping shapes of varied size, position and tilt, varied with `rands(min, max, n, seed)` (always give a seed); never one smooth cone or sphere.
+- Holes and gaps (chain links, arches, spaces between bars or legs) are at least 2 blocks wide, or they fill in when turned into blocks.
 
 # BUILDING TECHNIQUES
 - Pillars or columns stick out 1 block from the wall face at corners and between bays.
@@ -67,9 +77,9 @@ Think this through before writing code:
 - Palette: 3-5 main materials in clear roles (primary, secondary, accent, roof, glass).
 
 # SCULPTURE TECHNIQUES
-- Never build a sculpture only from boxes: bodies, limbs, heads, helmets, capes and creatures are spheres, scaled spheres, cylinders, cones and hulls. Boxes are only for pedestals, blades, straight plates and trims.
+- Never build a sculpture only from boxes: bodies, limbs, heads, helmets, capes, wings and creatures are made with the SHAPE TOOLS. Boxes are only for pedestals, blades, straight plates and trims.
 - Get the proportions right first (a heroic human figure is about 8 heads tall), then the pose. Ornaments (crests, horns, plumes, spikes, antennas) stay small next to what carries them, e.g. a crest no taller than the head.
-- Model from overlapping primitives: spheres, scaled spheres (`scale([a, b, c]) sphere(r)`), cylinders and cones (`cylinder(h, r1, r2)`), boxes, and `hull()` of two or three small spheres for limbs and tapered shapes. Use `rotate()` for the pose.
+- Model from overlapping primitives: spheres, scaled spheres (`scale([a, b, c]) sphere(r)`), cylinders and cones (`cylinder(h, r1, r2)`), boxes, `hull()` chains for limbs, tails and tapered shapes, and extruded outlines for wings and fins. Use `rotate()` for the pose.
 - Anything that must survive as blocks (fingers, a blade, a staff, horns) is at least 2 blocks thick at large scale; merge fingers into a hand.
 - Surface layering gives detail: armour plates, belts, straps and trims as slightly larger shells in contrasting blocks; recessed eyes; a cape as a curved shell at least 1 block thick.
 - At block scale two dark spots or holes side by side read as eyes. Only put a face where the subject has one; keep emblems one simple shape, and avoid symmetric dark pairs on the front of a body.

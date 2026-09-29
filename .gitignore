@@ -10,3 +10,5 @@ __pycache__/
 # Local test and loop output
 loops/
 effort-test/
+ModelTests/
+TestRun/

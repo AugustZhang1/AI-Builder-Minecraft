@@ -35,9 +35,12 @@ HEARTBEAT_SECONDS = 30
 # Build limits.
 START_ROOM = 16                    # the quick free-space check before designing
 GAP = 3                            # blocks between the player and the build's front
+MAX_SIDE = 256                     # widest/deepest build; its chunks are force-loaded while placing
 FALLBACK_BLOCK = "minecraft:stone"
 ANIMATE = True                     # !design: builders, corner markers and scaffolding (animate.py)
 REVIEW = True                      # !design: the AI checks a preview of its build once and may fix it
+BEST = False                       # !design: two designs at once, the AI keeps the better one (twice the AI usage)
+SMOOTH = True                      # stairs and slabs on sloped surfaces (build.smooth)
 CREW_SIZE = 3                      # armor-stand builders
 # Never placed; swapped for FALLBACK_BLOCK. Fluids and fire, TNT, falling blocks (plus every
 # *_concrete_powder), portals, blocks survival players can't break, and spawners.
@@ -84,10 +87,3 @@ def rcon_settings() -> tuple[str, int, str]:
     props = server_properties()
     return "127.0.0.1", int(props.get("rcon.port", 25575)), props["rcon.password"]
 
-
-def view_distance() -> int:
-    """The server's view-distance in chunks (vanilla default 10)."""
-    try:
-        return int(server_properties().get("view-distance", 10))
-    except ValueError:
-        return 10

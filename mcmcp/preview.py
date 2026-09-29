@@ -43,12 +43,86 @@ def _text_height(draw: ImageDraw.ImageDraw, text: str) -> int:
     return bbox[3] - bbox[1]
 
 
+def _shape_mask(block_id: str) -> np.ndarray | None:
+    """(2, 2, 2) bool mask over a cell's sub-cells [dx, dy, dz] for a slab or stairs; None for a full block.
+
+    States are in design space: north = +Y, east = +X. Missing states default to a bottom slab or
+    bottom stairs facing north.
+    """
+    base, _, rest = block_id.partition("[")
+    is_slab, is_stairs = base.endswith("_slab"), base.endswith("_stairs")
+    if not (is_slab or is_stairs):
+        return None
+    states = dict(kv.split("=", 1) for kv in rest.rstrip("]").split(",") if "=" in kv)
+    mask = np.zeros((2, 2, 2), dtype=bool)
+    if is_slab:
+        kind = states.get("type")
+        if kind == "double":
+            mask[:] = True
+        else:
+            mask[:, :, 1 if kind == "top" else 0] = True
+        return mask
+    top = states.get("half") == "top"
+    mask[:, :, 1 if top else 0] = True
+    side = mask[:, :, 0 if top else 1]  # the half-height step on the facing side
+    facing = states.get("facing")
+    if facing == "south":
+        side[:, 0] = True
+    elif facing == "east":
+        side[1, :] = True
+    elif facing == "west":
+        side[0, :] = True
+    else:
+        side[:, 1] = True
+    return mask
+
+
+def _upsample_shapes(grid: np.ndarray, palette: list[str]) -> np.ndarray | None:
+    """Grid at 2x resolution where slabs and stairs keep their shape; None if the grid has none."""
+    shaped = np.zeros(256, dtype=bool)
+    keep = np.ones((256, 2, 2, 2), dtype=bool)
+    for i, block_id in enumerate(palette[:256]):
+        mask = _shape_mask(block_id)
+        if mask is not None:
+            shaped[i] = True
+            keep[i] = mask
+    xs, ys, zs = np.nonzero(shaped[grid])
+    if len(xs) == 0:
+        return None
+    big = grid.repeat(2, axis=0).repeat(2, axis=1).repeat(2, axis=2)
+    vals = grid[xs, ys, zs]
+    for dx in range(2):
+        for dy in range(2):
+            for dz in range(2):
+                gone = ~keep[vals, dx, dy, dz]
+                big[2 * xs[gone] + dx, 2 * ys[gone] + dy, 2 * zs[gone] + dz] = 0
+    return big
+
+
+def _draw_face(draw: ImageDraw.ImageDraw, poly: list, fill, outl, a: int, b: int, half: bool) -> None:
+    """Fill a face and outline it; on a 2x grid only along the edges that lie on whole-block boundaries.
+
+    a, b are the cell coordinates along the face's two axes (the face is poly[0] + edges along a, then b).
+    """
+    if not half:
+        draw.polygon(poly, fill=fill, outline=outl)
+        return
+    draw.polygon(poly, fill=fill)
+    if outl:
+        k = (0, 1, 3, 2)[2 * (b & 1) + (a & 1)]  # the corner of this face that is a block corner
+        draw.line([poly[k - 1], poly[k], poly[(k + 1) % 4]], fill=outl)
+
+
 def _render_blocks_view(
     grid: np.ndarray,
     palette_rgb: list[tuple[int, int, int]],
-    s: int,
+    s: float,
+    half: bool = False,
 ) -> Image.Image:
-    """Render a single 2:1 dimetric view of a block grid."""
+    """Render a single 2:1 dimetric view of a block grid.
+
+    half: the grid is a 2x upsample from _upsample_shapes (s is the size of a sub-cell).
+    """
     X, Y, Z = grid.shape
     if X == 0 or Y == 0 or Z == 0:
         return Image.new("RGB", (1, 1), BG_COLOR)
@@ -94,7 +168,7 @@ def _render_blocks_view(
     front_cols = [tuple(min(255, max(0, int(round(c * 0.65)))) for c in col) for col in palette_rgb]
     outl_cols = (
         [tuple(min(255, max(0, int(round(c * 0.5)))) for c in col) for col in palette_rgb]
-        if s >= 4
+        if s * (2 if half else 1) >= 4
         else None
     )
 
@@ -106,13 +180,13 @@ def _render_blocks_view(
 
         if t:
             poly_t = [(u0, v0 - s), (u0 + s, v0 - 1.5 * s), (u0, v0 - 2 * s), (u0 - s, v0 - 1.5 * s)]
-            draw.polygon(poly_t, fill=top_cols[v_idx], outline=outl)
+            _draw_face(draw, poly_t, top_cols[v_idx], outl, x, y, half)
         if l:
             poly_l = [(u0, v0), (u0 - s, v0 - 0.5 * s), (u0 - s, v0 - 1.5 * s), (u0, v0 - s)]
-            draw.polygon(poly_l, fill=left_cols[v_idx], outline=outl)
+            _draw_face(draw, poly_l, left_cols[v_idx], outl, y, z, half)
         if f:
             poly_f = [(u0, v0), (u0 + s, v0 - 0.5 * s), (u0 + s, v0 - 1.5 * s), (u0, v0 - s)]
-            draw.polygon(poly_f, fill=front_cols[v_idx], outline=outl)
+            _draw_face(draw, poly_f, front_cols[v_idx], outl, x, z, half)
 
     return img
 
@@ -135,8 +209,14 @@ def blocks_png(grid: np.ndarray, palette: list[str]) -> bytes:
             base_id = block_id.split("[", 1)[0]
             palette_rgb.append(build.block_color(base_id))
 
-    view_fl = _render_blocks_view(grid, palette_rgb, s)
-    view_br = _render_blocks_view(grid[::-1, ::-1, :], palette_rgb, s)
+    # Slabs and stairs: draw from a 2x grid at half the pixel size. Too small to show at s == 1.
+    big = _upsample_shapes(grid, palette) if s >= 2 else None
+    if big is None:
+        view_fl = _render_blocks_view(grid, palette_rgb, s)
+        view_br = _render_blocks_view(grid[::-1, ::-1, :], palette_rgb, s)
+    else:
+        view_fl = _render_blocks_view(big, palette_rgb, s / 2, half=True)
+        view_br = _render_blocks_view(big[::-1, ::-1, :], palette_rgb, s / 2, half=True)
 
     clean_palette = [b.split("[", 1)[0] for b in palette]
     strip_bytes = build.preview_png(grid, clean_palette)
