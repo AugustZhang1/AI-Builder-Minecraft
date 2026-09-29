@@ -1024,15 +1024,25 @@ def place_design(
     dim: str,
     start_time: float,
     crew: animate.Crew | None = None,
+    summon_crew: bool = False,
 ) -> None:
     """Force-loads the build's chunks (so it can be bigger than the render distance), places it,
-    and always releases the chunks again."""
+    and always releases the chunks again.
+    summon_crew: summon the builder crew once the chunks are force-loaded, for !place whose spot
+    can be far from the player; it is removed again before the chunks are released."""
     shape = design[0].shape
     for cmd in forceload_commands(dim, "add", shape, origin, facing):
         rcon.command(cmd)
+    summoned: animate.Crew | None = None
     try:
+        if summon_crew:
+            rcon.command(animate.kill_crew_command())
+            summoned = crew = animate.Crew(rcon, dim, player, origin, facing, config.CREW_SIZE)
+            crew.summon(shape[0])
         _place_loaded(rcon, player, design, origin, facing, dim, start_time, crew)
     finally:
+        if summoned is not None:
+            summoned.remove()
         for cmd in forceload_commands(dim, "remove", shape, origin, facing):
             rcon.command(cmd)
 
@@ -1149,23 +1159,24 @@ def clear_preview(rcon: Rcon, player: str) -> None:
     """Removes the player's ghost preview, if any. Entities in unloaded chunks can't be killed,
     so if some are left the preview's chunks are force-loaded until they are gone (or
     config.GHOST_CLEAR_SECONDS pass)."""
-    p = PREVIEWS.pop(player.strip().lower(), None)
+    key = player.strip().lower()
+    p = PREVIEWS.get(key)
     if p is None:
         return
     kill = ghost.kill_command(player)
     killed = ghost.killed_count(rcon.command(kill))
-    if killed >= p.count:
-        return
-    for cmd in forceload_commands(p.dim, "add", p.shape, p.origin, p.facing):
-        rcon.command(cmd)
-    try:
-        deadline = time.monotonic() + config.GHOST_CLEAR_SECONDS
-        while killed < p.count and time.monotonic() < deadline:
-            time.sleep(0.5)
-            killed += ghost.killed_count(rcon.command(kill))
-    finally:
-        for cmd in forceload_commands(p.dim, "remove", p.shape, p.origin, p.facing):
-            rcon.command(cmd)
+    if killed < p.count:
+        try:
+            for cmd in forceload_commands(p.dim, "add", p.shape, p.origin, p.facing):
+                rcon.command(cmd)
+            deadline = time.monotonic() + config.GHOST_CLEAR_SECONDS
+            while killed < p.count and time.monotonic() < deadline:
+                time.sleep(0.5)
+                killed += ghost.killed_count(rcon.command(kill))
+        finally:
+            for cmd in forceload_commands(p.dim, "remove", p.shape, p.origin, p.facing):
+                rcon.command(cmd)
+    PREVIEWS.pop(key, None)  # only now: if a command failed, the record stays for a later retry
 
 
 def show_preview(
@@ -1229,7 +1240,6 @@ def run_place(rcon: Rcon, player: str) -> None:
     current position and facing."""
     STOP.clear()
     start_time = time.time()
-    crew: animate.Crew | None = None
     try:
         key = player.strip().lower()
         saved = LAST_DESIGNS.get(key)
@@ -1250,18 +1260,11 @@ def run_place(rcon: Rcon, player: str) -> None:
 
         clear_preview(rcon, player)
 
-        if get_animate():
-            rcon.command(animate.kill_crew_command())
-            crew = animate.Crew(rcon, dim, player, origin, facing, config.CREW_SIZE)
-            crew.summon(saved[0].shape[0])
-        place_design(rcon, player, saved, origin, facing, dim, start_time, crew=crew)
+        place_design(rcon, player, saved, origin, facing, dim, start_time, summon_crew=get_animate())
 
     except Exception as e:
         logger.exception("Place failed for player %s: %s", player, e)
         send_message(rcon, player, f"Build failed: {_reason(e)}")
-    finally:
-        if crew is not None:
-            crew.remove()
 
 
 def run_move(rcon: Rcon, player: str) -> None:
