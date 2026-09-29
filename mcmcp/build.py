@@ -103,9 +103,22 @@ def render_parts(scad_text: str, parts: list[str], build_dir: Path) -> dict[str,
     return stls
 
 
-def voxelize(stls: dict[str, Path], blocks: dict[str, str], max_size: int) -> tuple[np.ndarray, list[str]]:
+def voxelize(
+    stls: dict[str, Path],
+    blocks: dict[str, str],
+    max_dims: int | tuple[int, int, int],
+) -> tuple[np.ndarray, list[str], np.ndarray, float]:
     """Voxelize all parts into one shared grid of shape (X, Y, Z).
-    Returns (grid, palette): 0 = air, i = palette[i], palette[0] == "minecraft:air"."""
+    max_dims is an int (same limit on all 3 axes) or a tuple (wide_x, deep_y, tall_z).
+    Returns (grid, palette, offset, scale):
+    0 = air, i = palette[i], palette[0] == "minecraft:air".
+    offset: np.ndarray of 3 ints = design coordinate of grid[0,0,0] after trimming.
+    scale: float, 1.0 when not scaled."""
+    if isinstance(max_dims, (int, np.integer)):
+        limits = np.array([float(max_dims), float(max_dims), float(max_dims)])
+    else:
+        limits = np.array([float(d) for d in max_dims])
+
     loaded_meshes: dict[str, trimesh.Trimesh] = {}
     for part_name, block_id in blocks.items():
         if part_name in stls:
@@ -128,12 +141,13 @@ def voxelize(stls: dict[str, Path], blocks: dict[str, str], max_size: int) -> tu
     union_max = np.max(maxs, axis=0)
 
     # Measure from the grid origin (floor of the min corner) so the scaled design never
-    # needs more than max_size cells on any axis.
+    # needs more than limit cells on any axis.
     grid_min = np.floor(union_min)
-    max_extent = float(np.max(union_max - grid_min))
+    extents = union_max - grid_min
+    scale = 1.0
 
-    if max_extent > max_size:
-        scale = max_size / max_extent
+    if np.any(extents > limits):
+        scale = float(np.min(limits / extents))
         for m in loaded_meshes.values():
             m.apply_translation(-grid_min)
             m.apply_scale(scale)
@@ -208,7 +222,65 @@ def voxelize(stls: dict[str, Path], blocks: dict[str, str], max_size: int) -> tu
         min_pos[2] : max_pos[2] + 1,
     ].copy()
 
-    return trimmed_grid, palette
+    offset = (origin + min_pos).astype(int)
+    return trimmed_grid, palette, offset, scale
+
+
+def apply_mix(
+    grid: np.ndarray,
+    palette: list[str],
+    mix: dict[str, dict[str, float]],
+    seed: int | None = None,
+) -> tuple[np.ndarray, list[str]]:
+    """Apply texture mixes to surface cells of the grid.
+    Returns (new_grid, new_palette). Inputs are not mutated."""
+    new_grid = grid.copy()
+    new_palette = list(palette)
+    palette_map = {b: i for i, b in enumerate(new_palette)}
+
+    # Surface cells: solid cells with at least one neighbour air or outside grid.
+    is_solid = new_grid > 0
+    hidden = np.zeros_like(is_solid)
+    if new_grid.shape[0] > 2 and new_grid.shape[1] > 2 and new_grid.shape[2] > 2:
+        hidden[1:-1, 1:-1, 1:-1] = (
+            is_solid[1:-1, 1:-1, 1:-1]
+            & is_solid[:-2, 1:-1, 1:-1]
+            & is_solid[2:, 1:-1, 1:-1]
+            & is_solid[1:-1, :-2, 1:-1]
+            & is_solid[1:-1, 2:, 1:-1]
+            & is_solid[1:-1, 1:-1, :-2]
+            & is_solid[1:-1, 1:-1, 2:]
+        )
+    surface = is_solid & ~hidden
+
+    rng = np.random.default_rng(seed)
+
+    for base_block, variants in mix.items():
+        if base_block not in palette_map:
+            continue
+
+        for var_id in variants:
+            if var_id not in palette_map:
+                if len(new_palette) >= 256:
+                    raise BuildError("Too many distinct block types (max 255)")
+                palette_map[var_id] = len(new_palette)
+                new_palette.append(var_id)
+
+        base_idx = palette_map[base_block]
+        mask = surface & (new_grid == base_idx)
+        n_cells = int(np.count_nonzero(mask))
+        if n_cells == 0:
+            continue
+
+        var_names = list(variants.keys())
+        raw_weights = np.array([variants[v] for v in var_names], dtype=float)
+        probs = raw_weights / np.sum(raw_weights)
+        var_indices = np.array([palette_map[v] for v in var_names], dtype=new_grid.dtype)
+
+        draws = rng.choice(var_indices, size=n_cells, p=probs)
+        new_grid[mask] = draws
+
+    return new_grid, new_palette
 
 
 def _split_box(box: Box, max_volume: int) -> list[Box]:
@@ -286,6 +358,66 @@ def facing_from_yaw(yaw: float) -> str:
     """Snap a Minecraft yaw to "south", "west", "north" or "east"."""
     facings = ["south", "west", "north", "east"]
     return facings[int(round(yaw / 90)) % 4]
+
+
+_CLOCKWISE_FACINGS = ["north", "east", "south", "west"]
+_FACING_K = {"north": 0, "east": 1, "south": 2, "west": 3}
+
+
+def rotate_state(block: str, facing: str) -> str:
+    """Rotate block states from design space to Minecraft world orientation for facing."""
+    if facing not in _FACING_K:
+        raise ValueError(f"Unknown facing: {facing!r}")
+    k = _FACING_K[facing]
+    if k == 0:
+        return block
+
+    if "[" not in block or not block.endswith("]"):
+        return block
+
+    base_id, inside = block[:-1].split("[", 1)
+    if not inside:
+        return block
+
+    parts = inside.split(",")
+    new_parts = []
+    for part in parts:
+        p = part.strip()
+        if not p:
+            continue
+        if "=" not in p:
+            new_parts.append(p)
+            continue
+        key, val = p.split("=", 1)
+        key = key.strip()
+        val = val.strip()
+        if key == "facing":
+            if val in _CLOCKWISE_FACINGS:
+                idx = _CLOCKWISE_FACINGS.index(val)
+                new_val = _CLOCKWISE_FACINGS[(idx + k) % 4]
+                new_parts.append(f"{key}={new_val}")
+            else:
+                new_parts.append(p)
+        elif key == "axis":
+            if k % 2 == 1:
+                if val == "x":
+                    new_parts.append(f"{key}=z")
+                elif val == "z":
+                    new_parts.append(f"{key}=x")
+                else:
+                    new_parts.append(p)
+            else:
+                new_parts.append(p)
+        elif key == "rotation":
+            try:
+                n = int(val)
+                new_parts.append(f"{key}={(n + 4 * k) % 16}")
+            except ValueError:
+                new_parts.append(p)
+        else:
+            new_parts.append(p)
+
+    return f"{base_id}[{','.join(new_parts)}]"
 
 
 def to_world(
@@ -413,3 +545,98 @@ def preview_png(grid: np.ndarray, palette: list[str]) -> bytes:
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
+
+
+def _set_state(block: str, key: str, value: str) -> str:
+    """Set one block state, replacing any existing value for key."""
+    base_id, _, inside = block.partition("[")
+    states = [p for p in inside.rstrip("]").split(",") if p and p.split("=")[0] != key]
+    return f"{base_id}[{','.join(states + [f'{key}={value}'])}]"
+
+
+def with_persistent_leaves(block: str) -> str:
+    """Leaves get persistent=true so they don't decay."""
+    if block.split("[", 1)[0].endswith("_leaves"):
+        return _set_state(block, "persistent", "true")
+    return block
+
+
+def detail_boxes(
+    details: list[tuple[int, int, int, int, int, int, str] | tuple[int, int, int, str]],
+    offset: np.ndarray | tuple[int, int, int],
+    shape: tuple[int, int, int],
+) -> list[tuple[int, int, int, int, int, int, str]]:
+    """Convert details to grid coordinates, drop out-of-bounds, expand doors, and apply persistent leaves."""
+    X, Y, Z = shape
+    off_x, off_y, off_z = int(offset[0]), int(offset[1]), int(offset[2])
+    result: list[tuple[int, int, int, int, int, int, str]] = []
+
+    for item in details:
+        if len(item) == 4:
+            x1, y1, z1, block = item
+            x2, y2, z2 = x1, y1, z1
+        elif len(item) == 7:
+            x1, y1, z1, x2, y2, z2, block = item
+        else:
+            continue
+
+        gx1 = int(x1) - off_x
+        gy1 = int(y1) - off_y
+        gz1 = int(z1) - off_z
+        gx2 = int(x2) - off_x
+        gy2 = int(y2) - off_y
+        gz2 = int(z2) - off_z
+
+        base_id = block.split("[", 1)[0]
+        if base_id.endswith("_door"):
+            # Doors: bottom layer at gz1 with half=lower, upper layer at gz1+1 with half=upper.
+            # z2 is ignored. If upper layer is outside z range [0, Z], drop the door.
+            if not (-1 <= gx1 and gx2 <= X and -1 <= gy1 and gy2 <= Y and 0 <= gz1 and gz1 + 1 <= Z):
+                continue
+            lower_b = with_persistent_leaves(_set_state(block, "half", "lower"))
+            upper_b = with_persistent_leaves(_set_state(block, "half", "upper"))
+            result.append((gx1, gy1, gz1, gx2, gy2, gz1, lower_b))
+            result.append((gx1, gy1, gz1 + 1, gx2, gy2, gz1 + 1, upper_b))
+        else:
+            if not (-1 <= gx1 and gx2 <= X and -1 <= gy1 and gy2 <= Y and 0 <= gz1 and gz2 <= Z):
+                continue
+            b = with_persistent_leaves(block)
+            result.append((gx1, gy1, gz1, gx2, gy2, gz2, b))
+
+    return result
+
+
+def stamp_details(
+    grid: np.ndarray,
+    palette: list[str],
+    dboxes: list[tuple[int, int, int, int, int, int, str]],
+) -> tuple[np.ndarray, list[str]]:
+    """Stamp detail boxes into a copy of grid, clipped to grid bounds. For previews only."""
+    new_grid = grid.copy()
+    new_palette = list(palette)
+    palette_map = {b: i for i, b in enumerate(new_palette)}
+
+    X, Y, Z = new_grid.shape
+
+    for x1, y1, z1, x2, y2, z2, block in dboxes:
+        cx1 = max(0, x1)
+        cx2 = min(X - 1, x2)
+        cy1 = max(0, y1)
+        cy2 = min(Y - 1, y2)
+        cz1 = max(0, z1)
+        cz2 = min(Z - 1, z2)
+
+        if cx1 > cx2 or cy1 > cy2 or cz1 > cz2:
+            continue
+
+        base_id = block.split("[", 1)[0]
+        if base_id not in palette_map:
+            if len(new_palette) >= 256:
+                raise BuildError("Too many distinct block types (max 255)")
+            palette_map[base_id] = len(new_palette)
+            new_palette.append(base_id)
+        val = palette_map[base_id]
+
+        new_grid[cx1 : cx2 + 1, cy1 : cy2 + 1, cz1 : cz2 + 1] = val
+
+    return new_grid, new_palette
