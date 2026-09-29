@@ -226,6 +226,29 @@ def voxelize(
     return trimmed_grid, palette, offset, scale
 
 
+MIX_MIN_BASE = 0.7  # the base block keeps at least this share of a mixed surface
+MIX_MAX_TONE = 60   # variants further than this (RGB distance) from the base's colour are dropped
+MIX_PATCH = 3       # variants come in patches of this many blocks per side, not single specks
+
+
+def _mix_weights(base: str, variants: dict[str, float]) -> dict[str, float]:
+    """Weights for one mix: variants whose colour is far from the base's are dropped (unknown
+    colours are kept), and the base keeps at least MIX_MIN_BASE. Empty if nothing is left to mix."""
+    colours = _block_colors()
+    base_rgb = colours.get(base)
+    weights = {}
+    for var_id, weight in variants.items():
+        rgb = colours.get(var_id)
+        if var_id != base and base_rgb and rgb and np.linalg.norm(np.subtract(rgb, base_rgb)) > MIX_MAX_TONE:
+            continue
+        weights[var_id] = float(weight)
+    others = sum(w for v, w in weights.items() if v != base)
+    if others == 0:
+        return {}
+    weights[base] = max(weights.get(base, 0.0), others * MIX_MIN_BASE / (1 - MIX_MIN_BASE))
+    return weights
+
+
 def apply_mix(
     grid: np.ndarray,
     palette: list[str],
@@ -258,27 +281,28 @@ def apply_mix(
     for base_block, variants in mix.items():
         if base_block not in palette_map:
             continue
+        weights = _mix_weights(base_block, variants)
+        if not weights:
+            continue
 
-        for var_id in variants:
+        for var_id in weights:
             if var_id not in palette_map:
                 if len(new_palette) >= 256:
                     raise BuildError("Too many distinct block types (max 255)")
                 palette_map[var_id] = len(new_palette)
                 new_palette.append(var_id)
 
-        base_idx = palette_map[base_block]
-        mask = surface & (new_grid == base_idx)
-        n_cells = int(np.count_nonzero(mask))
-        if n_cells == 0:
+        coords = np.argwhere(surface & (new_grid == palette_map[base_block]))
+        if len(coords) == 0:
             continue
 
-        var_names = list(variants.keys())
-        raw_weights = np.array([variants[v] for v in var_names], dtype=float)
-        probs = raw_weights / np.sum(raw_weights)
-        var_indices = np.array([palette_map[v] for v in var_names], dtype=new_grid.dtype)
-
-        draws = rng.choice(var_indices, size=n_cells, p=probs)
-        new_grid[mask] = draws
+        # One draw per MIX_PATCH-sized patch, so weathering shows as patches rather than specks.
+        _, patch = np.unique(coords // MIX_PATCH, axis=0, return_inverse=True)
+        patch = patch.ravel()
+        var_indices = np.array([palette_map[v] for v in weights], dtype=new_grid.dtype)
+        probs = np.array(list(weights.values())) / sum(weights.values())
+        draws = rng.choice(var_indices, size=patch.max() + 1, p=probs)[patch]
+        new_grid[tuple(coords.T)] = draws
 
     return new_grid, new_palette
 

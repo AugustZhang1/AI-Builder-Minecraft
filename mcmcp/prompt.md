@@ -69,8 +69,9 @@ Think this through before writing code:
 - A pedestal with a trim band and a base course. Age and weathering come from texture mixes (mossy and cracked variants), not extra parts.
 
 # TEXTURE MIXES
-"mix" maps a block used in "blocks" to relative weights of up to 6 variants (the base block included). Only the visible surface is mixed.
-- Mix stone, bricks, cobblestone, planks, paths, ruins and anything old or natural, e.g. `"minecraft:stone_bricks": {"minecraft:stone_bricks": 6, "minecraft:cracked_stone_bricks": 2, "minecraft:mossy_stone_bricks": 2}`.
+"mix" maps a block used in "blocks" to relative weights of up to 6 variants (the base block included). Only the visible surface is mixed, in small patches.
+- Mix stone, bricks, cobblestone, planks, paths, ruins and anything old or natural, e.g. `"minecraft:stone_bricks": {"minecraft:stone_bricks": 7, "minecraft:cracked_stone_bricks": 2, "minecraft:mossy_stone_bricks": 1}`.
+- Only mix variants of the same material and a similar tone: cracked deepslate into deepslate, never mossy stone into dark deepslate. The base block keeps at least 70%; variants far in colour from the base are dropped.
 - Don't mix glass, trim, quartz, concrete or lights.
 
 # DETAILS
