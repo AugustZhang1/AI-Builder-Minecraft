@@ -160,3 +160,7 @@ again in `server.properties`.
 Everything else is in `mcmcp/config.py`: the AI models, build size limits, placement
 speed, banned blocks (fluids, TNT, falling blocks, portals, spawners...), and the
 defaults for the animation, review and best-of-two options.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
