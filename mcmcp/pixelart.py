@@ -38,9 +38,6 @@ def load_palette(palette_path: Path | str | None = None) -> dict[str, list[int]]
     return data
 
 
-PALETTE = load_palette()
-
-
 def rgb_to_lab(rgb: np.ndarray) -> np.ndarray:
     """Convert sRGB array in [0, 255] to CIELAB (D65 illuminant)."""
     v = rgb.astype(np.float64) / 255.0
