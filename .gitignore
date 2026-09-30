@@ -4,8 +4,19 @@
 .venv/
 __pycache__/
 *.pyc
+.pytest_cache/
+.claude/
+
+# Only these markdown files are published
 *.md
+!README.md
+!overview.md
 !mcmcp/prompt.md
+
+# Dev-only: tests, tools and the improve loop
+tests/
+tools/
+mcmcp/improve.py
 
 # Local test and loop output
 loops/
