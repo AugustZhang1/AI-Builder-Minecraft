@@ -5,8 +5,9 @@ in chat (optionally with an image link as a reference), an AI designs the build 
 OpenSCAD code, the code is rendered to meshes, the meshes are turned into blocks, and
 the blocks are placed in front of the player over RCON.
 
-It runs as a separate Python service next to the server. No mods or plugins are needed,
-so it works on vanilla, Fabric or modded servers alike.
+It runs as a separate Python program next to the server. No mods or plugins are
+needed, so it works on vanilla, Fabric and modded servers alike, and removing it leaves
+the server exactly as before.
 
 See [overview.md](overview.md) for how it works in detail.
 
@@ -40,19 +41,24 @@ chat line in logs/latest.log  (ops only)
 | `!designhelp` | Lists the commands |
 
 Only players in the server's `ops.json` can trigger builds, since every build uses
-your AI subscription.
+your AI subscription. Image links must be short direct links (chat is capped at 256
+characters).
 
 ## Requirements
 
-- A Minecraft Java 1.21.x server, on the same machine (the service reads the server's
+- A Minecraft Java 1.21.x server, on the same machine (the builder reads the server's
   `logs/latest.log`, `ops.json` and `server.properties`).
 - Python 3.12 or newer.
-- OpenSCAD, a recent development snapshot with the Manifold backend
-  (`--backend=manifold`). The old 2021.01 release is too slow.
-- At least one AI CLI, logged in:
-  - [Claude Code](https://docs.claude.com/en/docs/claude-code) (`claude`), which runs
-    on your Claude subscription, and/or
-  - Google Antigravity (`agy`) for Gemini.
+- OpenSCAD with the Manifold backend: either Docker (easiest), or a native
+  [development snapshot](https://openscad.org/downloads.html#snapshots). The old
+  2021.01 release found in most package managers is too slow.
+- An AI command-line tool, logged in:
+  - [Claude Code](https://www.anthropic.com/claude-code) (`claude`), which runs on your
+    Claude subscription (the default), and/or
+  - Google Antigravity (`agy`), for Gemini.
+
+The steps below are for Linux. Windows works too for running it by hand (use
+`venv\Scripts\python` and Docker Desktop).
 
 ## Install
 
@@ -64,36 +70,55 @@ your AI subscription.
    rcon.password=<a long random password>
    ```
 
-   Keep the RCON port closed to the internet; the service connects on `127.0.0.1`.
+   Keep the RCON port closed to the internet; the builder connects on `127.0.0.1` and
+   reads the password from this file.
 
 2. **Get the code and its Python libraries:**
 
    ```bash
-   git clone https://github.com/AugustZhang1/minecraft-mcp-v2.git mcmcp
-   cd mcmcp
+   git clone https://github.com/AugustZhang1/minecraft-mcp-v2.git ~/mcmcp
+   cd ~/mcmcp
    python3 -m venv venv
    venv/bin/pip install -r requirements.txt
    ```
 
-3. **Log the AI CLI in** as the user that will run the service: run `claude` and use
-   `/login` (and/or log `agy` in).
+3. **Set up OpenSCAD**, one of:
+   - **Docker:** install Docker, let your user run it
+     (`sudo usermod -aG docker $USER`, then log in again) and run
+     `docker pull openscad/openscad:dev`. Nothing else to configure.
+   - **Native:** install a development snapshot so that `openscad` is on your `PATH`,
+     or set `MCMCP_OPENSCAD` to its full path.
 
-4. **Point it at your server** with environment variables:
-
-   | Variable | Meaning |
-   |---|---|
-   | `MCMCP_SERVER_DIR` | The Minecraft server folder |
-   | `MCMCP_WORK_DIR` | Where build files and settings are saved |
-   | `MCMCP_OPENSCAD` | Path to the OpenSCAD binary (if unset, OpenSCAD runs in Docker with `openscad/openscad:dev`) |
-
-5. **Try it offline** (no server needed). This designs, renders and voxelizes, and
-   saves `design.scad`, `blocks.json` and `preview.png` in the work folder:
+4. **Install and log in to the AI CLI** as the user that will run the builder:
 
    ```bash
-   venv/bin/python -m mcmcp.main --once "a small stone watchtower"
+   curl -fsSL https://claude.ai/install.sh | bash
+   claude        # then type /login and follow the link
    ```
 
-6. **Run it:**
+   For Gemini, install and log in to `agy` as well, then switch in game with
+   `!designai gemini`.
+
+5. **Tell it where your server is:**
+
+   ```bash
+   export MCMCP_SERVER_DIR=/path/to/your/minecraft/server
+   ```
+
+   | Variable | Meaning | Default |
+   |---|---|---|
+   | `MCMCP_SERVER_DIR` | The Minecraft server folder | `./server` |
+   | `MCMCP_WORK_DIR` | Where build files and settings are saved | `./work` |
+   | `MCMCP_OPENSCAD` | Path to a native OpenSCAD binary | unset: use Docker |
+
+6. **Try it offline** (no server needed). This designs, renders and voxelizes, and
+   saves `design.scad`, `blocks.json` and `preview.png` in a folder under `work/`:
+
+   ```bash
+   venv/bin/python -m mcmcp.main --once "a small stone watchtower" --ai claude
+   ```
+
+7. **Run it:**
 
    ```bash
    venv/bin/python -m mcmcp.main
@@ -101,26 +126,34 @@ your AI subscription.
 
    Then type `!designhelp` in game.
 
-### Run as a service (Linux, systemd)
+### Run it as a service (systemd)
 
-`deploy/mcmcp.service` is a template. Replace `__USER__` and `__HOME__`, set
-`MCMCP_SERVER_DIR` to your server folder, and make sure `claude`/`agy` are on the
-service's `PATH` (add an `Environment=PATH=...` line if they are installed in your home
-folder). It assumes the server runs as `minecraft.service`, so the builder starts and
-stops with it; change `BindsTo`/`After`/`WantedBy` if yours is named differently.
+To keep it running in the background and start it at boot, fill in the template
+`deploy/mcmcp.service` and install it. Run this from `~/mcmcp`, as the same user and in
+the same shell where `claude` works, with your server folder filled in:
 
 ```bash
-sudo cp deploy/mcmcp.service /etc/systemd/system/mcmcp.service
+SERVER=/path/to/your/minecraft/server
+sed -e "s|__USER__|$USER|g" \
+    -e "s|__MCMCP_DIR__|$PWD|g" \
+    -e "s|__SERVER_DIR__|$SERVER|g" \
+    -e "s|__OPENSCAD__|$(command -v openscad)|g" \
+    -e "s|__PATH__|$PATH|g" \
+    deploy/mcmcp.service | sudo tee /etc/systemd/system/mcmcp.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now mcmcp
 journalctl -u mcmcp -f
 ```
 
-The unit runs at low priority with CPU and memory caps, so rendering can't starve the
-game.
+If `openscad` isn't installed, `MCMCP_OPENSCAD` is left empty and Docker is used. The
+service runs at low priority with CPU and memory caps, so rendering can't starve the
+game. If your server itself runs as a systemd service (say `minecraft.service`), you can
+add `BindsTo=minecraft.service` and `After=minecraft.service` under `[Unit]`, and set
+`WantedBy=minecraft.service`, so the builder starts and stops with it.
 
-**Uninstall:** `sudo systemctl disable --now mcmcp`, delete the unit file and the
-folder. The server is left exactly as before.
+**Uninstall:** `sudo systemctl disable --now mcmcp`, then delete
+`/etc/systemd/system/mcmcp.service` and the `~/mcmcp` folder. RCON can be switched off
+again in `server.properties`.
 
 ## Settings
 

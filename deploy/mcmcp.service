@@ -1,16 +1,16 @@
-# Template: replace __USER__ and __HOME__ when installing (kept out of git on purpose).
+# Template: fill in the __PLACEHOLDERS__ when installing (see README.md).
 [Unit]
-Description=mcmcp !design bridge (Claude -> OpenSCAD -> blocks over RCON)
-BindsTo=minecraft.service
-After=minecraft.service
+Description=mcmcp !design builder (AI -> OpenSCAD -> blocks over RCON)
+After=network.target
 
 [Service]
 User=__USER__
-WorkingDirectory=__HOME__/mcmcp
-Environment=MCMCP_SERVER_DIR=__HOME__/cobbleverse
-Environment=MCMCP_WORK_DIR=__HOME__/mcmcp/work
-Environment=MCMCP_OPENSCAD=__HOME__/mcmcp/bin/openscad
-ExecStart=__HOME__/mcmcp/venv/bin/python -m mcmcp.main
+WorkingDirectory=__MCMCP_DIR__
+Environment=MCMCP_SERVER_DIR=__SERVER_DIR__
+Environment=MCMCP_WORK_DIR=__MCMCP_DIR__/work
+Environment=MCMCP_OPENSCAD=__OPENSCAD__
+Environment=PATH=__PATH__
+ExecStart=__MCMCP_DIR__/venv/bin/python -m mcmcp.main
 Restart=on-failure
 RestartSec=10
 Nice=10
@@ -18,4 +18,4 @@ CPUQuota=100%
 MemoryMax=1536M
 
 [Install]
-WantedBy=minecraft.service
+WantedBy=multi-user.target

@@ -588,7 +588,7 @@ class Pacer:
 def block_rejected(reply: str) -> bool:
     """True if the server refused a command's block (a parse error: unknown block or state).
     Replies are checked by content, not by how they start: all RCON connections share one
-    reply buffer, so another client's output (e.g. Frank's) can be mixed into ours."""
+    reply buffer, so another RCON client's output can be mixed into ours."""
     return "<--[HERE]" in reply
 
 

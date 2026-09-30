@@ -2,6 +2,7 @@
 *.local.md
 
 .venv/
+venv/
 __pycache__/
 *.pyc
 .pytest_cache/
@@ -17,6 +18,10 @@ __pycache__/
 tests/
 tools/
 mcmcp/improve.py
+
+# Build output and a local test server (the default folders)
+work/
+server/
 
 # Local test and loop output
 loops/
