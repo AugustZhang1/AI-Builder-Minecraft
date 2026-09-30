@@ -1,4 +1,4 @@
-# minecraft-mcp-v2
+# AI-Builder-Minecraft
 
 An in-game AI builder for a Minecraft Java server. An op types `!design <description>`
 in chat (optionally with an image link as a reference), an AI designs the build as
@@ -44,6 +44,19 @@ Only players in the server's `ops.json` can trigger builds, since every build us
 your AI subscription. Image links must be short direct links (chat is capped at 256
 characters).
 
+## Quick setup with an AI agent
+
+On the machine that runs your Minecraft server, open an AI coding agent such as
+[Claude Code](https://www.anthropic.com/claude-code) and tell it:
+
+```
+Set up this Minecraft builder for me by following
+https://github.com/AugustZhang1/AI-Builder-Minecraft/blob/main/AI_SETUP.md
+```
+
+It installs everything, asks before changing your server, and tells you when to log in
+to your AI account. To do it by hand instead, follow the steps below.
+
 ## Requirements
 
 - A Minecraft Java 1.21.x server, on the same machine (the builder reads the server's
@@ -55,7 +68,7 @@ characters).
 - An AI command-line tool, logged in:
   - [Claude Code](https://www.anthropic.com/claude-code) (`claude`), which runs on your
     Claude subscription (the default), and/or
-  - Google Antigravity (`agy`), for Gemini.
+  - [Google Antigravity](https://antigravity.google) (`agy`), for Gemini.
 
 The steps below are for Linux. Windows works too for running it by hand (use
 `venv\Scripts\python` and Docker Desktop).
@@ -76,7 +89,7 @@ The steps below are for Linux. Windows works too for running it by hand (use
 2. **Get the code and its Python libraries:**
 
    ```bash
-   git clone https://github.com/AugustZhang1/minecraft-mcp-v2.git ~/mcmcp
+   git clone https://github.com/AugustZhang1/AI-Builder-Minecraft.git ~/mcmcp
    cd ~/mcmcp
    python3 -m venv venv
    venv/bin/pip install -r requirements.txt
@@ -96,8 +109,13 @@ The steps below are for Linux. Windows works too for running it by hand (use
    claude        # then type /login and follow the link
    ```
 
-   For Gemini, install and log in to `agy` as well, then switch in game with
-   `!designai gemini`.
+   For Gemini, also install Google Antigravity and sign in with Google, then switch in
+   game with `!designai gemini`:
+
+   ```bash
+   curl -fsSL https://antigravity.google/cli/install.sh | bash
+   agy           # then sign in with Google
+   ```
 
 5. **Tell it where your server is:**
 

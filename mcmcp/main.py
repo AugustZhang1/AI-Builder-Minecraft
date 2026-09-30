@@ -521,7 +521,7 @@ def download_image(source: str) -> bytes:
 
     req = urllib.request.Request(
         source,
-        headers={"User-Agent": "mcmcp/1.0 (Minecraft MCP Builder)"},
+        headers={"User-Agent": "mcmcp/1.0 (AI-Builder-Minecraft)"},
     )
     with urllib.request.urlopen(req, timeout=20.0) as resp:
         data_arr = bytearray()
@@ -2149,7 +2149,7 @@ def main() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     default_reach = config.MAX_SIDE
-    parser = argparse.ArgumentParser(description="Minecraft MCP v2 builder")
+    parser = argparse.ArgumentParser(description="AI-Builder-Minecraft")
     parser.add_argument("--once", type=str, default=None, help="Run one build and exit")
     parser.add_argument("--player", type=str, default=None, help="Player name for position and messages")
     parser.add_argument("--image", type=str, default=None, help="Image URL or local file path")

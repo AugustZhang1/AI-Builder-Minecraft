@@ -12,6 +12,7 @@ __pycache__/
 *.md
 !README.md
 !overview.md
+!AI_SETUP.md
 !mcmcp/prompt.md
 
 # Dev-only: tests, tools and the improve loop
