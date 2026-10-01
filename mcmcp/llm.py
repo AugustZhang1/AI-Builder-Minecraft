@@ -20,9 +20,9 @@ from typing import Any, Callable
 from PIL import Image
 
 try:
-    from . import config
+    from . import config, figure
 except ImportError:
-    from mcmcp import config
+    from mcmcp import config, figure
 
 
 class LlmError(Exception):
@@ -118,6 +118,26 @@ REVIEW_TEXT = (
     "in the same two fenced blocks (same rules and limits), keeping everything that already works."
 )
 
+FIGURE_REVIEW_TEXT = (
+    "Your design was built. The image shows a preview of the result as blocks: two angled views, then front, side and "
+    "top views (the player sees the front), and on the right a close-up of the head from the front. "
+    "The builder has already applied your \"pose\" and stamped your \"face\". "
+    "Compare the front view and the close-up with the reference image (or the request, if there is none), point by point: "
+    "1. Body: does it turn and lean the way the image shows? "
+    "2. Head: does it turn and tilt the way the image shows? "
+    "3. Face (the close-up): are the eyes, brows and mouth on the face where the image has them, "
+    "not on the hair or off its edge, readable, with the right expression? "
+    "When a zoomed reference face is shown, compare the close-up with it: eyelids, gaze, brows, mouth corners and markings. "
+    "4. Arms, hands, legs and held things: where the image has them? "
+    "5. Silhouette, proportions and signature features: anything broken, floating or merged into blobs? "
+    "Then check the component inventory at the top of your code, item by item: is every listed component built and showing? "
+    "First write one short line per point: what the image shows, and what the build shows. "
+    "Then, if all five match and nothing from the inventory is missing, end with exactly KEEP. Otherwise fix the 1-3 "
+    "biggest problems (a missing component, a wrong turn, lean or tilt in \"pose\", the face in \"face\") and reply "
+    "with the complete corrected design in the same two fenced blocks (same rules and limits), keeping everything "
+    "that already works."
+)
+
 FIX_TEXT = (
     "Your design was built. The image is a preview of the result as blocks: "
     "two angled views, then front, side and top views (the player sees the front). "
@@ -127,11 +147,14 @@ FIX_TEXT = (
 )
 
 
-def _review_text(feedback: str | None) -> str:
-    """REVIEW_TEXT, or FIX_TEXT when the player asked for changes."""
-    if feedback is None or not feedback.strip():
-        return REVIEW_TEXT
-    return FIX_TEXT.format(feedback=feedback.strip())
+def _review_text(feedback: str | None, raw: str = "") -> str:
+    """REVIEW_TEXT (or FIGURE_REVIEW_TEXT for a figure), or FIX_TEXT when the player asked for changes."""
+    if feedback is not None and feedback.strip():
+        return FIX_TEXT.format(feedback=feedback.strip())
+    pose, face = figure.features(raw)
+    if pose is not None or face is not None:
+        return FIGURE_REVIEW_TEXT
+    return REVIEW_TEXT
 
 
 PICK_TEXT = (
@@ -173,7 +196,7 @@ def _build_gemini_user_text(
         user_text += (
             f"\n\nYour design is the file {work / 'design.txt'}."
             f"\nThe preview image is the file {work / 'preview.png'}. Look at both first."
-            f"\n\n{_review_text(feedback)}"
+            f"\n\n{_review_text(feedback, review[0])}"
         )
     if pick:
         user_text += (
@@ -194,11 +217,18 @@ def _build_gemini_prompt(
     work_dir: Path | None = None,
     feedback: str | None = None,
 ) -> str:
-    system_prompt = _prepare_prompt_text().rstrip()
+    """Builds the prompt for Gemini. The instructions go in instructions.md in work_dir
+    because on the command line they pass Windows' limit."""
+    work = (work_dir or _CLI_WORKDIR).resolve()
+    work.mkdir(parents=True, exist_ok=True)
+    (work / "instructions.md").write_text(_prepare_prompt_text().rstrip(), encoding="utf-8")
     user_text = _build_gemini_user_text(
         description, limits, image_png, review=review, pick=pick, work_dir=work_dir, feedback=feedback
     )
-    return f"{system_prompt}\n\n{GEMINI_RULES}\n\n{user_text}"
+    return (
+        f"Your instructions are the file {work / 'instructions.md'}. Read all of it first and follow it exactly."
+        f"\n\n{GEMINI_RULES}\n\n{user_text}"
+    )
 
 
 def _agy_command(prompt_text: str) -> list[str]:
@@ -261,7 +291,7 @@ def _build_stdin_payload(
         content.append(_image_part(preview_png))
         content.append({
             "type": "text",
-            "text": _review_text(feedback),
+            "text": _review_text(feedback, raw),
         })
 
     if pick:
@@ -659,6 +689,8 @@ def parse_reply(
                 f"Invalid block id {block_id!r} for part {part!r}: must match ^minecraft:[a-z0-9_]+$"
             )
         blocks[part] = block_id
+
+    figure.apply_colors(data, blocks)
 
     mix = parse_mix(data.get("mix", {}))
     details = parse_details(data.get("details", []))

@@ -25,10 +25,10 @@ import numpy as np
 from PIL import Image
 
 try:
-    from . import animate, build, config, ghost, llm, pixelart, preview
+    from . import animate, build, config, figure, ghost, llm, pixelart, preview
     from .rcon import Rcon, RconError
 except ImportError:
-    from mcmcp import animate, build, config, ghost, llm, pixelart, preview
+    from mcmcp import animate, build, config, figure, ghost, llm, pixelart, preview
     from mcmcp.rcon import Rcon, RconError
 
 logger = logging.getLogger("mcmcp")
@@ -536,11 +536,20 @@ def download_image(source: str) -> bytes:
 
 
 def load_image_png(source: str) -> bytes:
-    """Downloads or reads an image, converts to RGB, thumbnails, and encodes to PNG bytes."""
-    data = download_image(source)
-    with Image.open(io.BytesIO(data)) as img:
+    """Downloads or reads an image as PNG bytes: transparent pixels white, the longest side
+    config.IMAGE_MAX_SIDE (smaller images enlarged, larger ones shrunk)."""
+    with Image.open(io.BytesIO(download_image(source))) as img:
+        rgba = img.convert("RGBA")
+        img = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+        img.alpha_composite(rgba)
         img = img.convert("RGB")
-        img.thumbnail((config.IMAGE_MAX_SIDE, config.IMAGE_MAX_SIDE))
+        longest = max(img.size)
+        if longest < config.IMAGE_MAX_SIDE and longest > 0:
+            scale = config.IMAGE_MAX_SIDE / longest
+            new_size = (round(img.width * scale), round(img.height * scale))
+            img = img.resize(new_size, Image.LANCZOS)
+        else:
+            img.thumbnail((config.IMAGE_MAX_SIDE, config.IMAGE_MAX_SIDE))
         out = io.BytesIO()
         img.save(out, format="PNG")
         return out.getvalue()
@@ -744,14 +753,33 @@ def voxelize_design(
     details: list[tuple[int, int, int, int, int, int, str]],
     limits: tuple[int, int, int],
     build_dir: Path,
+    raw: str = "",
 ) -> tuple[np.ndarray, list[str], list[tuple[int, int, int, int, int, int, str]], bool]:
     """Voxelize, add stairs and slabs on slopes, apply texture mixes, map details and save the previews.
+    With a "pose" or "face" in raw (the AI's reply), the part meshes are posed first and the face is
+    stamped on the head; a bad pose or face is skipped, it never fails the build.
     Returns (grid, palette, dboxes, details_skipped); details are skipped if the design was scaled down."""
+    pose, face = figure.features(raw)
+    posed = None
+    if pose or face:
+        try:  # poses the part meshes and writes the STLs back, before voxelizing
+            posed = figure.pose_parts(stls, pose, face)
+        except Exception as e:
+            logger.warning("Pose skipped: %s", e)
     grid, palette, offset, scale = build.voxelize(stls, blocks, limits)
+    painted = []
+    if face and posed is not None:
+        try:
+            painted = figure.paint_face(grid, palette, offset, scale, face, posed)
+        except Exception as e:
+            logger.warning("Face skipped: %s", e)
     shaped = []  # stairs and slabs, in grid coordinates; the AI's details go after them and win
     if config.SMOOTH:
         try:  # smoothing never fails a build
-            grid, shaped = build.smooth(stls, blocks, grid, palette, offset, limits)
+            smoothed, new_shaped = build.smooth(stls, blocks, grid, palette, offset, limits)
+            if painted:  # the face stays on top: its cells set again, no stairs or slabs in front of it
+                smoothed, new_shaped = figure.restore_face(smoothed, palette, new_shaped, painted)
+            grid, shaped = smoothed, new_shaped
         except Exception as e:
             logger.warning("Stairs and slabs skipped: %s", e)
     if mix:
@@ -759,12 +787,19 @@ def voxelize_design(
     skipped = scale < 1.0 and bool(details)
     dboxes = shaped + ([] if skipped else build.detail_boxes(details, offset, grid.shape))
 
+    def write_closeup() -> None:  # the head from the front, for the review
+        if posed is not None and posed.centre is not None:
+            png = figure.head_closeup(*build.stamp_details(grid, palette, dboxes), offset, scale, posed)
+            if png:
+                (build_dir / "closeup.png").write_bytes(png)
+
     # Previews never fail a build.
     for name, make in (
         ("preview.png", lambda: (build_dir / "preview.png").write_bytes(
             preview.blocks_png(*build.stamp_details(grid, palette, dboxes)))),
         ("mesh.png", lambda: (build_dir / "mesh.png").write_bytes(preview.mesh_png(stls, blocks))),
         ("mesh.glb", lambda: preview.export_glb(stls, blocks, build_dir / "mesh.glb")),
+        ("closeup.png", write_closeup),
     ):
         try:
             make()
@@ -785,10 +820,20 @@ def save_design(
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "response.txt").write_text(raw, encoding="utf-8")
     (out_dir / "design.scad").write_text(scad, encoding="utf-8")
-    (out_dir / "blocks.json").write_text(
-        json.dumps({"blocks": blocks, "mix": mix, "details": details}, indent=2),
-        encoding="utf-8",
-    )
+    (out_dir / "blocks.json").write_text(blocks_json(raw, blocks, mix, details), encoding="utf-8")
+
+
+def blocks_json(
+    raw: str,
+    blocks: dict[str, str],
+    mix: dict[str, dict[str, float]],
+    details: list[tuple[int, int, int, int, int, int, str]],
+) -> str:
+    """The blocks.json text of a design: blocks, mix, details, and the reply's "pose" and "face" if it has them."""
+    data: dict[str, Any] = {"blocks": blocks, "mix": mix, "details": details}
+    pose, face = figure.features(raw)
+    data.update({k: v for k, v in (("pose", pose), ("face", face)) if v})
+    return json.dumps(data, indent=2)
 
 
 def build_revision(
@@ -800,7 +845,7 @@ def build_revision(
     scad, blocks, mix, details, raw = rev
     save_design(out_dir, raw, scad, blocks, mix, details)
     stls = build.render_parts(scad, list(blocks), out_dir)
-    grid, palette, dboxes, skipped = voxelize_design(scad, stls, blocks, mix, details, limits, out_dir)
+    grid, palette, dboxes, skipped = voxelize_design(scad, stls, blocks, mix, details, limits, out_dir, raw)
     return scad, blocks, mix, details, grid, palette, dboxes, skipped
 
 
@@ -818,6 +863,23 @@ def review_design(
     try:
         send_fn("Checking the design...")
         preview_png = (build_dir / "preview.png").read_bytes()
+        pose, face = figure.features(raw)
+        if pose or face:
+            try:
+                panels: list[tuple[str, bytes]] = []
+                closeup = build_dir / "closeup.png"
+                if closeup.exists():
+                    panels.append(("head close-up (front)", closeup.read_bytes()))
+                box = face.get("box") if isinstance(face, dict) else None
+                if image_png and box:
+                    zoomed = figure.zoomed_reference(box, image_png)
+                    if zoomed:
+                        panels.append(("reference face (zoomed)", zoomed))
+                if panels:
+                    preview_png = figure.composite(preview_png, panels)
+                    (build_dir / "review_input.png").write_bytes(preview_png)
+            except Exception as e:
+                logger.warning("Review composite skipped: %s", e)
         heartbeat = Heartbeat(send_fn, provider_name, config.HEARTBEAT_SECONDS)
         heartbeat.start()
         try:
@@ -1471,7 +1533,7 @@ def run_build(
             final_dir = build_dir
             send_message(rcon, player, "Rendering...")
             stls = build.render_parts(scad, list(blocks), build_dir)
-            grid, palette, dboxes, skipped = voxelize_design(scad, stls, blocks, mix, details, limits, build_dir)
+            grid, palette, dboxes, skipped = voxelize_design(scad, stls, blocks, mix, details, limits, build_dir, raw)
 
             if get_review() and not overridden and not STOP.is_set():
                 rev = review_design(
@@ -1551,7 +1613,9 @@ def run_offline_build(
         scad = Path(scad_file).read_text(encoding="utf-8")
         blocks_data = json.loads(Path(blocks_file).read_text(encoding="utf-8"))
         blocks, mix, details = load_blocks_data(blocks_data)
-        raw = ""
+        # A rebuild keeps the "pose" and "face" saved in blocks.json: as a reply with only those.
+        kept = {k: blocks_data[k] for k in ("pose", "face") if isinstance(blocks_data, dict) and blocks_data.get(k)}
+        raw = f"```json\n{json.dumps(kept)}\n```\n" if kept else ""
         t_design = 0.0
     elif best:
         t0 = time.time()
@@ -1581,11 +1645,8 @@ def run_offline_build(
         )
         t_review = time.time() - t0
     else:
-        (build_dir / "blocks.json").write_text(
-            json.dumps({"blocks": blocks, "mix": mix, "details": details}, indent=2),
-            encoding="utf-8",
-        )
-        if raw:
+        (build_dir / "blocks.json").write_text(blocks_json(raw, blocks, mix, details), encoding="utf-8")
+        if raw and not (scad_file and blocks_file):
             (build_dir / "response.txt").write_text(raw, encoding="utf-8")
 
         t0 = time.time()
@@ -1593,7 +1654,7 @@ def run_offline_build(
         t_render = time.time() - t0
 
         t0 = time.time()
-        grid, palette, dboxes, skipped = voxelize_design(scad, stls, blocks, mix, details, limits, build_dir)
+        grid, palette, dboxes, skipped = voxelize_design(scad, stls, blocks, mix, details, limits, build_dir, raw)
         t_vox = time.time() - t0
 
         if get_review() and not (scad_file and blocks_file):

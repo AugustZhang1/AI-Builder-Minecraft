@@ -696,13 +696,19 @@ def block_color(block_id: str) -> tuple[int, int, int]:
     return (int(rgb[0]), int(rgb[1]), int(rgb[2]))
 
 
+_AO_NEIGHBOURS = [(-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),
+                  (-1, -1, 0.5), (-1, 1, 0.5), (1, -1, 0.5), (1, 1, 0.5)]  # (da, db, weight)
+
+
 def _render_view(
     grid: np.ndarray,
     palette_rgb: np.ndarray,
     proj_axis: int,
     reverse_proj: bool = False,
 ) -> np.ndarray:
-    """Renders a single orthographic view of shape (H, W, 3), one pixel per cell."""
+    """Renders a single orthographic view of shape (H, W, 3), one pixel per cell. Farther cells are
+    darker, and so is a cell next to cells that stand in front of it (ambient occlusion, as with the
+    game's smooth lighting), so relief shows in the flat views."""
     v = np.moveaxis(grid, proj_axis, -1)
     if reverse_proj:
         v = v[:, :, ::-1]
@@ -713,8 +719,15 @@ def _render_view(
     first_idx = np.argmax(solid, axis=-1)
     block_val = np.take_along_axis(v, first_idx[..., None], axis=-1).squeeze(-1)
 
-    depth = first_idx
-    shade = 1.0 - 0.6 * (depth.astype(np.float32) / max(D - 1, 1))
+    depth = np.where(has_solid, first_idx.astype(np.float32), np.inf)
+    padded = np.pad(depth, 1, constant_values=np.inf)
+    occlusion = np.zeros(depth.shape, dtype=np.float32)
+    for da, db, w in _AO_NEIGHBOURS:
+        nb = padded[1 + da : 1 + da + depth.shape[0], 1 + db : 1 + db + depth.shape[1]]
+        with np.errstate(invalid="ignore"):  # air next to air: inf - inf, counted as 0
+            diff = np.nan_to_num(depth - nb, nan=0.0, neginf=0.0, posinf=0.0)
+        occlusion += w * np.clip(diff, 0, 3) / 3
+    shade = (1.0 - 0.6 * (first_idx.astype(np.float32) / max(D - 1, 1))) * np.clip(1.0 - 0.09 * occlusion, 0.45, 1.0)
 
     base_rgb = palette_rgb[block_val]
     shaded_rgb = base_rgb * shade[..., None]
