@@ -2,7 +2,9 @@
 venv/
 __pycache__/
 *.pyc
+.env
 
 # Build output and a local test server (the default folders)
 work/
 server/
+statues/

@@ -15,6 +15,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 import threading
 import time
 import urllib.request
@@ -25,10 +26,10 @@ import numpy as np
 from PIL import Image
 
 try:
-    from . import animate, build, config, figure, ghost, llm, pixelart, preview
+    from . import animate, build, config, figure, ghost, llm, pixelart, preview, statue, statue_grid
     from .rcon import Rcon, RconError
 except ImportError:
-    from mcmcp import animate, build, config, figure, ghost, llm, pixelart, preview
+    from mcmcp import animate, build, config, figure, ghost, llm, pixelart, preview, statue, statue_grid
     from mcmcp.rcon import Rcon, RconError
 
 logger = logging.getLogger("mcmcp")
@@ -80,6 +81,8 @@ HELP_LINES = (
     "!move - moves the preview to where you stand, facing where you look",
     "!place - builds the preview where it is (or your last design where you stand)",
     "!pixelart <image link> [width] - builds the picture as a flat wall (no AI)",
+    "!statue <image or mesh> [model] - builds a 3D statue from an image or .glb mesh",
+    "!statue list - shows 3D models and saved mesh files",
     "!designstop - stops the build that is running, or removes your preview",
     "!designai [claude|gemini] - shows or switches the AI",
     "!designanim [on|off] - shows or switches the builder crew animation",
@@ -510,13 +513,13 @@ def check_grid_room(
     return True
 
 
-def download_image(source: str) -> bytes:
+def download_image(source: str, max_bytes: int = config.IMAGE_MAX_BYTES) -> bytes:
     """Downloads or reads an image into raw bytes (URL or local path)."""
     path = Path(source)
     if path.is_file():
         data = path.read_bytes()
-        if len(data) > config.IMAGE_MAX_BYTES:
-            raise ValueError(f"Image exceeds maximum size ({len(data)} > {config.IMAGE_MAX_BYTES})")
+        if len(data) > max_bytes:
+            raise ValueError(f"Image exceeds maximum size ({len(data)} > {max_bytes})")
         return data
 
     req = urllib.request.Request(
@@ -530,15 +533,15 @@ def download_image(source: str) -> bytes:
             if not chunk:
                 break
             data_arr.extend(chunk)
-            if len(data_arr) > config.IMAGE_MAX_BYTES:
-                raise ValueError(f"Image exceeds maximum size of {config.IMAGE_MAX_BYTES} bytes")
+            if len(data_arr) > max_bytes:
+                raise ValueError(f"Image exceeds maximum size of {max_bytes} bytes")
         return bytes(data_arr)
 
 
-def load_image_png(source: str) -> bytes:
-    """Downloads or reads an image as PNG bytes: transparent pixels white, the longest side
+def png_from_bytes(data: bytes) -> bytes:
+    """Converts raw image bytes to PNG bytes: transparent pixels white, the longest side
     config.IMAGE_MAX_SIDE (smaller images enlarged, larger ones shrunk)."""
-    with Image.open(io.BytesIO(download_image(source))) as img:
+    with Image.open(io.BytesIO(data)) as img:
         rgba = img.convert("RGBA")
         img = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
         img.alpha_composite(rgba)
@@ -553,6 +556,12 @@ def load_image_png(source: str) -> bytes:
         out = io.BytesIO()
         img.save(out, format="PNG")
         return out.getvalue()
+
+
+def load_image_png(source: str) -> bytes:
+    """Downloads or reads an image as PNG bytes: transparent pixels white, the longest side
+    config.IMAGE_MAX_SIDE (smaller images enlarged, larger ones shrunk)."""
+    return png_from_bytes(download_image(source))
 
 
 def estimate_seconds(fill_boxes: list[build.Box]) -> float:
@@ -1787,6 +1796,39 @@ def parse_pixelart_command(message: str) -> tuple[bool, str | None, int | None]:
     return True, None, None
 
 
+def parse_statue_command(message: str) -> tuple[bool, str | None, str | None]:
+    """Parses a message for the !statue command.
+
+    Returns (is_command, source_or_None, model_or_None).
+    """
+    msg = message.strip()
+    if not (msg.lower().startswith("!statue") and (len(msg) == 7 or msg[7].isspace())):
+        return False, None, None
+
+    rest = msg[7:].strip()
+    if not rest:
+        return True, None, None
+
+    match = URL_RE.search(rest)
+    if match:
+        url = match.group(0)
+        tokens = (rest[:match.start()] + " " + rest[match.end():]).split()
+        if not tokens:
+            return True, url, None
+        if len(tokens) == 1:
+            return True, url, tokens[0].lower()
+        return True, None, None
+
+    tokens = rest.split()
+    if len(tokens) == 1:
+        tok = tokens[0]
+        if tok.lower() == "list":
+            return True, "list", None
+        return True, tok, None
+
+    return True, None, None
+
+
 def run_pixelart(
     rcon: Rcon,
     player: str,
@@ -1966,6 +2008,221 @@ def run_offline_pixelart(source: str, width: int | None = None) -> None:
     print(f"Preview: {preview_path}")
 
 
+def run_statue(
+    rcon: Rcon,
+    player: str,
+    source: str,
+    model: str | None = None,
+) -> None:
+    """Executes the 3D statue pipeline."""
+    STOP.clear()
+    key = player.strip().lower()
+    try:
+        # 1. Player spot & clear preview
+        origin, facing, dim = player_spot(rcon, player)
+        clear_preview(rcon, player)
+
+        # 2. World limits
+        try:
+            limits = world_limits(origin[1], dim)
+        except ValueError as e:
+            send_message(rcon, player, str(e), prefix="[statue]")
+            return
+
+        # 3. Room check
+        if not start_room_free(rcon, origin, facing, dim):
+            send_message(
+                rcon,
+                player,
+                "Not enough room here. Stand on open, flat ground and try again.",
+                prefix="[statue]",
+            )
+            return
+
+        if STOP.is_set():
+            raise statue.StatueStopped("Stopped.")
+
+        # 4. Work folder
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        work_dir = config.WORK_DIR / f"{timestamp}-{player}-statue"
+        work_dir.mkdir(parents=True, exist_ok=True)
+
+        # 5. Get the mesh
+        reference_png: bytes | None = None
+        is_url = source.startswith("http://") or source.startswith("https://")
+        if is_url:
+            data = download_image(source, max_bytes=config.MESH_MAX_BYTES)
+            if statue.is_glb(data):
+                glb_path = work_dir / "model.glb"
+                glb_path.write_bytes(data)
+            else:
+                if len(data) > config.IMAGE_MAX_BYTES:
+                    raise statue.StatueError(
+                        f"Image exceeds maximum size of {config.IMAGE_MAX_BYTES} bytes"
+                    )
+                reference_png = png_from_bytes(data)
+                model_name = (model.lower() if model else None) or config.STATUE_MODEL
+                shown = statue.MODELS[model_name][0].split(" (")[0] if model_name in statue.MODELS else model_name
+                send_fn = lambda msg: send_message(rcon, player, msg, prefix="[statue]")
+                send_fn(f"Making a 3D model with {shown} (1-3 minutes)...")
+                heartbeat = Heartbeat(send_fn, shown, config.HEARTBEAT_SECONDS)
+                heartbeat.start()
+                try:
+                    glb_path = statue.generate(model_name, reference_png, work_dir, stop=STOP)
+                finally:
+                    heartbeat.stop()
+
+                saved_name = statue.save_mesh(glb_path)
+                send_message(
+                    rcon,
+                    player,
+                    f"Saved as {saved_name}; !statue {saved_name} builds it again without using the quota.",
+                    prefix="[statue]",
+                )
+        else:
+            mesh_path = statue.find_mesh(source)
+            if mesh_path is None:
+                raise statue.StatueError(f"Unknown mesh: {source}.")
+            glb_path = work_dir / "model.glb"
+            shutil.copyfile(mesh_path, glb_path)
+
+        if STOP.is_set():
+            raise statue.StatueStopped("Stopped.")
+
+        # 6. GLB to grid
+        grid, palette = statue_grid.glb_to_grid(glb_path, limits)
+
+        if STOP.is_set():
+            raise statue.StatueStopped("Stopped.")
+
+        # 7. Colour check (only with reference image and config.STATUE_COLOUR_CHECK)
+        if reference_png is not None and config.STATUE_COLOUR_CHECK:
+            send_message(rcon, player, "Checking the colours...", prefix="[statue]")
+            try:
+                statue_png = statue_grid.views_png(grid, palette)
+                lines = statue_grid.block_lines(grid, palette)
+                allowed = sorted(pixelart.load_palette())
+                swaps = llm.colour_check(reference_png, statue_png, lines, allowed, stop=STOP)
+                palette, n_swaps = statue_grid.apply_swaps(palette, swaps)
+                send_message(rcon, player, f"Colours checked: {n_swaps} blocks swapped.", prefix="[statue]")
+            except llm.LlmStopped:
+                raise
+            except Exception as e:
+                logger.warning("Colour check failed for %s: %s", player, e)
+                send_message(rcon, player, "Colour check failed; kept the model's colours.", prefix="[statue]")
+
+        if STOP.is_set():
+            raise statue.StatueStopped("Stopped.")
+
+        # 8. Write preview.png and request.txt
+        w, d, t = limits
+        (work_dir / "preview.png").write_bytes(build.preview_png(grid, palette))
+        (work_dir / "request.txt").write_text(
+            f"Player: {player}\nSource: {source}\n"
+            f"Model: {(model or config.STATUE_MODEL) if reference_png is not None else 'none (mesh)'}\n"
+            f"Limits: {w}x{d}x{t}\n",
+            encoding="utf-8",
+        )
+
+        # 9. Keep design for !place/!move, clear last sources for !designfix
+        design_tuple = (grid, palette, [])
+        LAST_DESIGNS[key] = design_tuple
+        LAST_SOURCES.pop(key, None)
+
+        show_preview(rcon, player, design_tuple, origin, facing, dim)
+
+    except (statue.StatueStopped, llm.LlmStopped):
+        send_message(rcon, player, "Stopped.", prefix="[statue]")
+    except statue.StatueError as e:
+        send_message(rcon, player, str(e), prefix="[statue]")
+    except Exception as e:
+        logger.exception("Statue failed for player %s: %s", player, e)
+        send_message(rcon, player, f"Statue failed: {_reason(e)}", prefix="[statue]")
+
+
+def run_offline_statue(
+    source: str,
+    model: str | None = None,
+    size: int | None = None,
+) -> None:
+    """Processes a 3D statue offline without RCON."""
+    reach = config.MAX_SIDE
+    if size is None:
+        size = reach
+    limits = (size, size, size)
+
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    work_dir = config.WORK_DIR / f"{timestamp}-statue"
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    reference_png: bytes | None = None
+    is_url = source.startswith("http://") or source.startswith("https://")
+
+    if is_url:
+        data = download_image(source, max_bytes=config.MESH_MAX_BYTES)
+        if statue.is_glb(data):
+            glb_path = work_dir / "model.glb"
+            glb_path.write_bytes(data)
+        else:
+            if len(data) > config.IMAGE_MAX_BYTES:
+                raise ValueError(
+                    f"Image exceeds maximum size of {config.IMAGE_MAX_BYTES} bytes"
+                )
+            reference_png = png_from_bytes(data)
+    elif Path(source).is_file():
+        p = Path(source)
+        file_bytes = p.read_bytes()
+        if p.suffix.lower() == ".glb" or statue.is_glb(file_bytes):
+            glb_path = work_dir / "model.glb"
+            shutil.copyfile(p, glb_path)
+        else:
+            if len(file_bytes) > config.IMAGE_MAX_BYTES:
+                raise ValueError(
+                    f"Image exceeds maximum size of {config.IMAGE_MAX_BYTES} bytes"
+                )
+            reference_png = png_from_bytes(file_bytes)
+    else:
+        mesh_path = statue.find_mesh(source)
+        if mesh_path is None:
+            raise statue.StatueError(f"Unknown mesh: {source}.")
+        glb_path = work_dir / "model.glb"
+        shutil.copyfile(mesh_path, glb_path)
+
+    if reference_png is not None:
+        model_name = (model.lower() if model else None) or config.STATUE_MODEL
+        print(f"Generating statue with {model_name}...")
+        glb_path = statue.generate(model_name, reference_png, work_dir)
+        saved_name = statue.save_mesh(glb_path)
+        print(f"Saved as {saved_name}; !statue {saved_name} builds it again without using the quota.")
+
+    grid, palette = statue_grid.glb_to_grid(glb_path, limits)
+
+    if reference_png is not None and config.STATUE_COLOUR_CHECK:
+        print("Checking the colours...")
+        try:
+            statue_png = statue_grid.views_png(grid, palette)
+            lines = statue_grid.block_lines(grid, palette)
+            allowed = sorted(pixelart.load_palette())
+            swaps = llm.colour_check(reference_png, statue_png, lines, allowed)
+            palette, n_swaps = statue_grid.apply_swaps(palette, swaps)
+            print(f"Colours checked: {n_swaps} blocks swapped.")
+        except Exception as e:
+            logger.warning("Colour check failed: %s", e)
+            print("Colour check failed; kept the model's colours.")
+
+    preview_bytes = build.preview_png(grid, palette)
+    preview_path = work_dir / "preview.png"
+    preview_path.write_bytes(preview_bytes)
+
+    (work_dir / "request.txt").write_text(
+        f"Source: {source}\n"
+        f"Model: {(model or config.STATUE_MODEL) if reference_png is not None else 'none (mesh)'}\n"
+        f"Limits: {limits}\n",
+        encoding="utf-8",
+    )
+    print(f"Preview: {preview_path}")
+
+
 def handle_chat_line(
     player: str,
     message: str,
@@ -2089,6 +2346,64 @@ def handle_chat_line(
                     build_lock.release()
 
         t = threading.Thread(target=px_worker, daemon=True)
+        t.start()
+        return
+
+    is_statue_cmd, statue_source, statue_model = parse_statue_command(message)
+    if is_statue_cmd:
+        if not is_op(player, config.OPS_FILE):
+            send_message(rcon, player, "Only ops can use !statue.", prefix="[statue]")
+            return
+
+        if statue_source is None:
+            send_message(
+                rcon,
+                player,
+                "Usage: !statue <image link> [model]  or  !statue <mesh>  or  !statue list",
+                prefix="[statue]",
+            )
+            return
+
+        if statue_source == "list":
+            for name, (desc, _) in statue.MODELS.items():
+                label = f"{name} (default)" if name == config.STATUE_MODEL else name
+                send_message(rcon, player, f"{label} - {desc}", prefix="[statue]")
+            meshes = statue.mesh_files()
+            if meshes:
+                send_message(rcon, player, f"Mesh files: {', '.join(meshes)}", prefix="[statue]")
+            else:
+                send_message(rcon, player, "Mesh files: none (put .glb files in statues/)", prefix="[statue]")
+            return
+
+        # Refuse unknown model before the lock
+        if statue_model is not None and statue_model not in statue.MODELS:
+            send_message(rcon, player, f"Unknown model: {statue_model}. !statue list shows them.", prefix="[statue]")
+            return
+
+        # Refuse unknown mesh before the lock (bare name not starting with http:// or https://)
+        is_url = statue_source.startswith("http://") or statue_source.startswith("https://")
+        if not is_url:
+            if statue.find_mesh(statue_source) is None:
+                send_message(rcon, player, f"No mesh file called {statue_source}. !statue list shows them.", prefix="[statue]")
+                return
+
+        if build_lock is not None and not build_lock.acquire(blocking=False):
+            send_message(
+                rcon,
+                player,
+                "A build is already running. Try again when it finishes.",
+                prefix="[statue]",
+            )
+            return
+
+        def statue_worker():
+            try:
+                run_statue(rcon, player, statue_source, model=statue_model)
+            finally:
+                if build_lock is not None:
+                    build_lock.release()
+
+        t = threading.Thread(target=statue_worker, daemon=True)
         t.start()
         return
 
@@ -2231,6 +2546,8 @@ def main() -> None:
     )
     parser.add_argument("--pixelart", type=str, default=None, help="Image URL or file path for pixel art")
     parser.add_argument("--width", type=int, default=None, help="Width for pixel art")
+    parser.add_argument("--statue", type=str, default=None, help="Image URL, file path, or mesh name for 3D statue")
+    parser.add_argument("--model", type=str, default=None, help="Model name for 3D statue generation")
 
     args = parser.parse_args()
 
@@ -2240,6 +2557,14 @@ def main() -> None:
             run_pixelart(rcon, args.player, args.pixelart, width=args.width)
         else:
             run_offline_pixelart(args.pixelart, width=args.width)
+        return
+
+    if args.statue:
+        if args.player:
+            rcon = Rcon(*config.rcon_settings())
+            run_statue(rcon, args.player, args.statue, model=args.model)
+        else:
+            run_offline_statue(args.statue, model=args.model, size=args.size)
         return
 
     # Determine if running in one-shot mode or service mode

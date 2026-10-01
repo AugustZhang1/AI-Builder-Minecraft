@@ -170,6 +170,18 @@ PICK_TEXT = (
     "Otherwise reply with only the PICK line."
 )
 
+COLOUR_CHECK_TEXT = """You check the colours of a Minecraft statue made from a picture.
+A 3D model was generated from the reference picture and turned into blocks, each block the nearest colour of the
+model's texture. The texture is often darker, duller or tinted, so whole areas can end up in the wrong block.
+Compare the statue with the reference, area by area (hair, skin, clothes, legs, shoes, accessories), and replace
+each block that gives an area the wrong colour or hue with a block that matches the reference.
+First write one short line per area: the colour in the reference, the colour on the statue, and the blocks there.
+Then end with a JSON object mapping block ids to replacement block ids, e.g.
+{"minecraft:nether_bricks": "minecraft:gray_concrete"}. Replacements must come from the allowed list. Replace a
+block when its area's colour or hue clearly differs from the reference (too dark, too dull, wrong tint all count);
+a swap changes every block of that id, so check the block isn't also used in an area that is right. End with {} if
+the colours are right."""
+
 
 def _build_gemini_user_text(
     description: str,
@@ -380,64 +392,25 @@ def _kill_process_tree(proc: subprocess.Popen) -> None:
                 pass
 
 
-def _cli_text(
-    description: str,
-    limits: tuple[int, int, int] | int,
-    image_png: bytes | None = None,
-    timeout: float = config.CLAUDE_TIMEOUT,
+def _run_cli(
+    cmd: list[str],
+    stdin_payload: str | None,
+    work: Path,
+    timeout: float,
     provider: str = "claude",
-    review: tuple[str, bytes] | None = None,
-    work_dir: Path | None = None,
-    pick: tuple[tuple[str, bytes], tuple[str, bytes]] | None = None,
     stop: threading.Event | None = None,
-    feedback: str | None = None,
 ) -> Iterator[str]:
-    """Runs the Claude or Gemini CLI and yields text chunks synchronously.
-    work_dir is the folder for its files (default _CLI_WORKDIR); calls that run at the same
-    time need different ones. If stop gets set, the CLI is killed and LlmStopped is raised."""
-    if provider not in config.PROVIDERS:
-        raise LlmError(f"Unknown provider: {provider!r}. Must be one of {config.PROVIDERS}")
-
-    work = work_dir or _CLI_WORKDIR
-    work.mkdir(parents=True, exist_ok=True)
-
-    if provider == "claude":
-        prompt_file = _prepare_prompt_file(work)
-        cmd = _cli_command(prompt_file)
-        stdin_payload: str | None = _build_stdin_payload(
-            description, limits, image_png=image_png, review=review, pick=pick, feedback=feedback
-        )
-        stdin_mode = subprocess.PIPE
-        delta_fn = _cli_delta
-        cli_name = "claude"
-    elif provider == "gemini":
-        ref_file = work / "ref.png"
-        ref_file.unlink(missing_ok=True)
-        if image_png:
-            ref_file.write_bytes(image_png)
-        preview_file = work / "preview.png"
-        preview_file.unlink(missing_ok=True)
-        if review:
-            (work / "design.txt").write_text(review[0], encoding="utf-8")
-            preview_file.write_bytes(review[1])
-        if pick:
-            for label, (raw, preview_png) in zip("ab", pick):
-                (work / f"design_{label}.txt").write_text(raw, encoding="utf-8")
-                (work / f"preview_{label}.png").write_bytes(preview_png)
-        prompt_text = _build_gemini_prompt(
-            description, limits, image_png, review=review, pick=pick, work_dir=work, feedback=feedback
-        )
-        cmd = _agy_command(prompt_text)
-        stdin_payload = None
-        stdin_mode = subprocess.DEVNULL
-        delta_fn = _agy_delta
-        cli_name = "gemini"
-    else:
-        raise LlmError(f"Unknown provider: {provider!r}. Must be one of {config.PROVIDERS}")
-
+    """Runs a CLI command (Claude or Gemini) and yields text chunks as they arrive.
+    Handles process lifecycle, timeouts (raises LlmError), stop events (raises LlmStopped),
+    and error exit codes (raises LlmError)."""
     env = dict(os.environ)
     env.pop("ANTHROPIC_API_KEY", None)
     env.pop("ANTHROPIC_AUTH_TOKEN", None)
+
+    stdin_mode = subprocess.PIPE if stdin_payload is not None else subprocess.DEVNULL
+    delta_fn = _cli_delta if provider == "claude" else _agy_delta
+    cli_name = provider
+    display_name = "Claude" if provider == "claude" else "Gemini"
 
     popen_kwargs: dict[str, Any] = {
         "cwd": work,
@@ -517,7 +490,6 @@ def _cli_text(
             feeder.join(timeout=2.0)
         _kill_process_tree(proc)
 
-    display_name = "Claude" if provider == "claude" else "Gemini"
     if stopped:
         raise LlmStopped(f"{display_name} stopped")
 
@@ -527,6 +499,58 @@ def _cli_text(
     if proc.returncode != 0:
         noise = f": {last_noise[-300:]}" if last_noise else ""
         raise LlmError(f"{cli_name} exited with code {proc.returncode}{noise}")
+
+
+def _cli_text(
+    description: str,
+    limits: tuple[int, int, int] | int,
+    image_png: bytes | None = None,
+    timeout: float = config.CLAUDE_TIMEOUT,
+    provider: str = "claude",
+    review: tuple[str, bytes] | None = None,
+    work_dir: Path | None = None,
+    pick: tuple[tuple[str, bytes], tuple[str, bytes]] | None = None,
+    stop: threading.Event | None = None,
+    feedback: str | None = None,
+) -> Iterator[str]:
+    """Runs the Claude or Gemini CLI and yields text chunks synchronously.
+    work_dir is the folder for its files (default _CLI_WORKDIR); calls that run at the same
+    time need different ones. If stop gets set, the CLI is killed and LlmStopped is raised."""
+    if provider not in config.PROVIDERS:
+        raise LlmError(f"Unknown provider: {provider!r}. Must be one of {config.PROVIDERS}")
+
+    work = work_dir or _CLI_WORKDIR
+    work.mkdir(parents=True, exist_ok=True)
+
+    if provider == "claude":
+        prompt_file = _prepare_prompt_file(work)
+        cmd = _cli_command(prompt_file)
+        stdin_payload: str | None = _build_stdin_payload(
+            description, limits, image_png=image_png, review=review, pick=pick, feedback=feedback
+        )
+    elif provider == "gemini":
+        ref_file = work / "ref.png"
+        ref_file.unlink(missing_ok=True)
+        if image_png:
+            ref_file.write_bytes(image_png)
+        preview_file = work / "preview.png"
+        preview_file.unlink(missing_ok=True)
+        if review:
+            (work / "design.txt").write_text(review[0], encoding="utf-8")
+            preview_file.write_bytes(review[1])
+        if pick:
+            for label, (raw, preview_png) in zip("ab", pick):
+                (work / f"design_{label}.txt").write_text(raw, encoding="utf-8")
+                (work / f"preview_{label}.png").write_bytes(preview_png)
+        prompt_text = _build_gemini_prompt(
+            description, limits, image_png, review=review, pick=pick, work_dir=work, feedback=feedback
+        )
+        cmd = _agy_command(prompt_text)
+        stdin_payload = None
+    else:
+        raise LlmError(f"Unknown provider: {provider!r}. Must be one of {config.PROVIDERS}")
+
+    yield from _run_cli(cmd, stdin_payload, work, timeout, provider=provider, stop=stop)
 
 
 def is_banned(block_id: str) -> bool:
@@ -843,3 +867,78 @@ def pick(
         raise
     except Exception as exc:
         raise LlmError(f"Pick failed: {exc}") from exc
+
+
+def parse_swaps(text: str) -> dict[str, str]:
+    """Parse block swaps from LLM response.
+
+    Finds the last {...} object without nested braces in the text and parses
+    it as JSON. Only str -> str pairs are kept. Returns {} if none or invalid.
+    """
+    matches = re.findall(r"\{[^{}]*\}", text)
+    if not matches:
+        return {}
+    try:
+        data = json.loads(matches[-1])
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, str)}
+
+
+def colour_check(
+    reference_png: bytes,
+    statue_png: bytes,
+    block_lines: list[str],
+    allowed: list[str],
+    stop: threading.Event | None = None,
+    timeout: float = 300,
+    work_dir: Path | None = None,
+) -> dict[str, str]:
+    """Checks the colours of a statue against reference image using Claude CLI.
+
+    Writes COLOUR_CHECK_TEXT to prompt file in work_dir, sends reference image,
+    statue views image, block lines and allowed replacement blocks to Claude.
+    Returns parsed block swaps mapping old_id -> new_id.
+    """
+    work = work_dir or _CLI_WORKDIR
+    work.mkdir(parents=True, exist_ok=True)
+
+    prompt_file = work / "colour_check.md"
+    prompt_file.write_text(COLOUR_CHECK_TEXT, encoding="utf-8")
+    cmd = _cli_command(prompt_file)
+
+    blocks_text = (
+        "Blocks used (most first; height 0% = feet, 100% = top of the head):\n"
+        + "\n".join(block_lines)
+        + "\n\nAllowed replacement blocks:\n"
+        + ", ".join(allowed)
+    )
+
+    content: list[dict[str, Any]] = [
+        {"type": "text", "text": "Reference picture:"},
+        _image_part(reference_png),
+        {"type": "text", "text": "The statue as blocks: front (as in the picture), side, back:"},
+        _image_part(statue_png),
+        {"type": "text", "text": blocks_text},
+    ]
+
+    msg = {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": content,
+        },
+    }
+    stdin_payload = json.dumps(msg) + "\n"
+
+    try:
+        chunks = list(_run_cli(cmd, stdin_payload, work, timeout, provider="claude", stop=stop))
+        raw_response = "".join(chunks)
+        return parse_swaps(raw_response)
+    except LlmError:
+        raise
+    except Exception as exc:
+        raise LlmError(f"Colour check failed: {exc}") from exc
+

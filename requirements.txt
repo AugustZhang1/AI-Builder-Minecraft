@@ -4,3 +4,4 @@ scipy==1.18.1
 rtree==1.4.1
 embreex==4.4.0
 Pillow==12.3.0
+gradio_client==2.7.1

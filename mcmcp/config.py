@@ -4,6 +4,30 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
+
+def load_env(path: Path) -> None:
+    """Load KEY=VALUE pairs from a .env file into os.environ if not already set."""
+    path = Path(path)
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key = key.strip()
+        val = val.strip()
+        if len(val) >= 2 and (
+            (val.startswith('"') and val.endswith('"'))
+            or (val.startswith("'") and val.endswith("'"))
+        ):
+            val = val[1:-1]
+        if key:
+            os.environ.setdefault(key, val)
+
+
+load_env(ROOT / ".env")
+
 # Minecraft server folder (logs/latest.log, ops.json, server.properties).
 SERVER_DIR = Path(os.environ.get("MCMCP_SERVER_DIR", ROOT / "server"))
 LOG_FILE = SERVER_DIR / "logs" / "latest.log"
@@ -69,6 +93,14 @@ BLOCK_COLORS_FILE = Path(__file__).resolve().parent / "block_colors.json"  # bui
 
 IMAGE_MAX_BYTES = 8_000_000
 IMAGE_MAX_SIDE = 1568              # px, longest side sent to Claude
+
+# !statue (image-to-3D models and saved meshes).
+STATUE_DIR = Path(os.environ.get("MCMCP_STATUE_DIR", ROOT / "statues"))  # saved and pre-loaded .glb meshes
+STATUE_MODEL = "hunyuan"           # default model (tencent/Hunyuan3D-2.1)
+STATUE_HEIGHT = 180                # blocks tall by default (capped by the world limits); more height, more detail
+STATUE_TIMEOUT = 600               # seconds to wait for model generation
+MESH_MAX_BYTES = 50_000_000        # max download size for .glb meshes (50 MB)
+STATUE_COLOUR_CHECK = True         # post-generation colour comparison with Claude
 
 
 def server_properties() -> dict[str, str]:
