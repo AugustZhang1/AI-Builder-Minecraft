@@ -116,6 +116,12 @@ and logged in; just run the check.
 2. Ask the user to run `agy` once in their own terminal and sign in with Google.
 3. Check it: `agy -p "Reply with just OK"`.
 
+**Statues from pictures** (optional, for `!statue <image link>`): ask the user for a
+free Hugging Face access token (huggingface.co, Settings, Access Tokens, read access),
+and put it in a `.env` file in the project folder as `HF_TOKEN=<token>`
+(see `.env.example`). Never print or commit it. Without it, `!statue` still builds
+`.glb` meshes.
+
 ## 6. Test without the server
 
 This designs a small build, renders it and turns it into blocks, without touching the

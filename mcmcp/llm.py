@@ -182,6 +182,14 @@ block when its area's colour or hue clearly differs from the reference (too dark
 a swap changes every block of that id, so check the block isn't also used in an area that is right. End with {} if
 the colours are right."""
 
+STATUE_REVIEW_TEXT = """You check the shape of a Minecraft statue made from a 3D model of the reference picture.
+You get the reference and the statue as blocks (front as in the picture, side, back).
+Compare the shape with the picture: missing or extra parts (limbs, hands, hair, accessories), stumps or lumps that
+are not in the picture, wrong lengths (hair, cloak, sleeves), wrong pose. Ignore colours (checked separately),
+blockiness, and parts the picture does not show.
+Reply with up to 5 lines, each starting with "- ", most important first, each one short and concrete (what and where,
+e.g. "- The right hand is missing."). If the shape matches, reply only "- Looks right."."""
+
 
 def _build_gemini_user_text(
     description: str,
@@ -887,6 +895,27 @@ def parse_swaps(text: str) -> dict[str, str]:
     return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, str)}
 
 
+def parse_review(text: str) -> list[str]:
+    """Parse shape review bullet points from LLM response.
+
+    Takes lines starting with '- ' (after stripping whitespace), removes
+    the '- ' and strips, drops empty items, keeps at most 5, and cuts
+    each to 200 characters at a word (ending in "..."). Other text is ignored.
+    """
+    reviews: list[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("- "):
+            continue
+        item = line[2:].strip()
+        if not item:
+            continue
+        reviews.append(item if len(item) <= 200 else item[:197].rsplit(" ", 1)[0] + "...")
+        if len(reviews) == 5:
+            break
+    return reviews
+
+
 def colour_check(
     reference_png: bytes,
     statue_png: bytes,
@@ -942,3 +971,47 @@ def colour_check(
     except Exception as exc:
         raise LlmError(f"Colour check failed: {exc}") from exc
 
+
+def statue_review(
+    reference_png: bytes,
+    statue_png: bytes,
+    stop: threading.Event | None = None,
+    timeout: float = 300,
+    work_dir: Path | None = None,
+) -> list[str]:
+    """Checks the shape of a statue against reference image using Claude CLI.
+
+    Writes STATUE_REVIEW_TEXT to prompt file in work_dir, sends reference image
+    and statue views image to Claude. Returns parsed review bullet points.
+    """
+    work = work_dir or _CLI_WORKDIR
+    work.mkdir(parents=True, exist_ok=True)
+
+    prompt_file = work / "statue_review.md"
+    prompt_file.write_text(STATUE_REVIEW_TEXT, encoding="utf-8")
+    cmd = _cli_command(prompt_file)
+
+    content: list[dict[str, Any]] = [
+        {"type": "text", "text": "Reference picture:"},
+        _image_part(reference_png),
+        {"type": "text", "text": "The statue as blocks: front (as in the picture), side, back:"},
+        _image_part(statue_png),
+    ]
+
+    msg = {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": content,
+        },
+    }
+    stdin_payload = json.dumps(msg) + "\n"
+
+    try:
+        chunks = list(_run_cli(cmd, stdin_payload, work, timeout, provider="claude", stop=stop))
+        raw_response = "".join(chunks)
+        return parse_review(raw_response)
+    except LlmError:
+        raise
+    except Exception as exc:
+        raise LlmError(f"Statue review failed: {exc}") from exc

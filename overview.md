@@ -110,6 +110,21 @@ holds the average texture colour of blocks that look the same on every face.
 Transparent pixels become air. Upscaled sprites are shrunk back to 1 pixel per block,
 and the size steps down until the wall fits the free space.
 
+## Statues
+
+`!statue <image link>` sends the picture to a free image-to-3D model on Hugging Face
+(Hunyuan3D-2.1 by default; `!statue list` shows the others) and saves the mesh in
+`statues/`, so `!statue <name>` builds it again without using the quota. A `.glb` link
+is built directly. The mesh is voxelized to the chosen height (default 180 blocks) and
+its texture colours are mapped to the block palette. Anime face and eye detectors
+(ONNX, downloaded once to `models/`) find the eyes on the front and paint them onto the
+blocks, since averaging would blur them away.
+
+With `!statuecheck on`, Claude compares the blocks with the picture: it swaps block
+colours that are clearly off and lists shape problems (missing hands, stumps, wrong
+lengths) in chat. For a mesh, give the picture as a second link:
+`!statue <mesh link or name> <image link>`.
+
 ## Code layout
 
 | File | What |
@@ -122,6 +137,10 @@ and the size steps down until the wall fits the free space.
 | `mcmcp/animate.py` | Builder crew, scaffolding and markers |
 | `mcmcp/preview.py` | Preview images of a build, for the AI's review |
 | `mcmcp/pixelart.py` | `!pixelart` |
+| `mcmcp/statue.py` | `!statue`: image-to-3D models and saved meshes |
+| `mcmcp/statue_grid.py` | Mesh to blocks for statues, and their preview images |
+| `mcmcp/statue_eyes.py` | Finds and paints a statue's eyes |
+| `mcmcp/figure.py` | Posing, face and colours for character designs |
 | `mcmcp/rcon.py` | A minimal RCON client |
 | `mcmcp/config.py` | Settings |
 | `deploy/mcmcp.service` | systemd unit template |

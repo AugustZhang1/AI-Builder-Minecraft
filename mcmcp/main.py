@@ -81,8 +81,10 @@ HELP_LINES = (
     "!move - moves the preview to where you stand, facing where you look",
     "!place - builds the preview where it is (or your last design where you stand)",
     "!pixelart <image link> [width] - builds the picture as a flat wall (no AI)",
-    "!statue <image or mesh> [model] - builds a 3D statue from an image or .glb mesh",
+    "!statue <image or mesh> [model] [height] - builds a 3D statue (height 40-256 blocks, default 180)",
+    "!statue <mesh link or name> <image link> [height] - a mesh with its picture, for !statuecheck",
     "!statue list - shows 3D models and saved mesh files",
+    "!statuecheck [on|off] - shows or switches the AI's check of a statue against its picture",
     "!designstop - stops the build that is running, or removes your preview",
     "!designai [claude|gemini] - shows or switches the AI",
     "!designanim [on|off] - shows or switches the builder crew animation",
@@ -140,6 +142,12 @@ def get_best() -> bool:
     return value if isinstance(value, bool) else config.BEST
 
 
+def get_statue_check() -> bool:
+    """Whether !statue checks colours and shape against a picture (set with !statuecheck; default config.STATUE_CHECK)."""
+    value = load_settings().get("statue_check")
+    return value if isinstance(value, bool) else config.STATUE_CHECK
+
+
 def _parse_word_command(message: str, word: str) -> tuple[bool, str | None]:
     """Parses `word [arg]` (case-insensitive). Returns (is_command, arg_or_None)."""
     msg = message.strip()
@@ -168,6 +176,11 @@ def parse_review_command(message: str) -> tuple[bool, str | None]:
 def parse_best_command(message: str) -> tuple[bool, str | None]:
     """Parses a message for the !designbest command. Returns (is_command, arg_or_None)."""
     return _parse_word_command(message, "!designbest")
+
+
+def parse_statuecheck_command(message: str) -> tuple[bool, str | None]:
+    """Parses a message for the !statuecheck command. Returns (is_command, arg_or_None)."""
+    return _parse_word_command(message, "!statuecheck")
 
 
 def parse_place_command(message: str) -> bool:
@@ -1796,37 +1809,96 @@ def parse_pixelart_command(message: str) -> tuple[bool, str | None, int | None]:
     return True, None, None
 
 
-def parse_statue_command(message: str) -> tuple[bool, str | None, str | None]:
+def parse_statue_command(
+    message: str,
+) -> tuple[bool, str | None, str | None, int | None, str | None]:
     """Parses a message for the !statue command.
 
-    Returns (is_command, source_or_None, model_or_None).
+    Returns (is_command, source_or_None, model_or_None, height_or_None, reference_url_or_None).
     """
     msg = message.strip()
     if not (msg.lower().startswith("!statue") and (len(msg) == 7 or msg[7].isspace())):
-        return False, None, None
+        return False, None, None, None, None
 
     rest = msg[7:].strip()
     if not rest:
-        return True, None, None
+        return True, None, None, None, None
 
-    match = URL_RE.search(rest)
-    if match:
-        url = match.group(0)
-        tokens = (rest[:match.start()] + " " + rest[match.end():]).split()
-        if not tokens:
-            return True, url, None
-        if len(tokens) == 1:
-            return True, url, tokens[0].lower()
-        return True, None, None
+    urls = URL_RE.findall(rest)
+    if len(urls) > 2:
+        return True, None, None, None, None
+
+    if len(urls) == 2:
+        source = urls[0]
+        reference_url = urls[1]
+        tokens = URL_RE.sub(" ", rest).split()
+        if len(tokens) > 2:
+            return True, None, None, None, None
+        model: str | None = None
+        height: int | None = None
+        for tok in tokens:
+            if tok.isdigit():
+                if height is not None:
+                    return True, None, None, None, None
+                h_val = int(tok)
+                if not (40 <= h_val <= 256):
+                    return True, None, None, None, None
+                height = h_val
+            else:
+                if model is not None:
+                    return True, None, None, None, None
+                model = tok.lower()
+        return True, source, model, height, reference_url
+
+    if len(urls) == 1:
+        the_url = urls[0]
+        tokens = URL_RE.sub(" ", rest).split()
+        if len(tokens) > 2:
+            return True, None, None, None, None
+        height: int | None = None
+        non_digit_tokens: list[str] = []
+        for tok in tokens:
+            if tok.isdigit():
+                if height is not None:
+                    return True, None, None, None, None
+                h_val = int(tok)
+                if not (40 <= h_val <= 256):
+                    return True, None, None, None, None
+                height = h_val
+            else:
+                non_digit_tokens.append(tok)
+
+        if len(non_digit_tokens) > 1:
+            return True, None, None, None, None
+
+        if len(non_digit_tokens) == 1:
+            tok = non_digit_tokens[0]
+            if tok.lower() in statue.MODELS:
+                return True, the_url, tok.lower(), height, None
+            else:
+                return True, tok, None, height, the_url
+
+        return True, the_url, None, height, None
 
     tokens = rest.split()
     if len(tokens) == 1:
         tok = tokens[0]
         if tok.lower() == "list":
-            return True, "list", None
-        return True, tok, None
+            return True, "list", None, None, None
+        return True, tok, None, None, None
 
-    return True, None, None
+    if len(tokens) == 2:
+        name, h_tok = tokens
+        if name.lower() == "list":
+            return True, None, None, None, None
+        if not h_tok.isdigit():
+            return True, None, None, None, None
+        h_val = int(h_tok)
+        if not (40 <= h_val <= 256):
+            return True, None, None, None, None
+        return True, name, None, h_val, None
+
+    return True, None, None, None, None
 
 
 def run_pixelart(
@@ -2013,9 +2085,12 @@ def run_statue(
     player: str,
     source: str,
     model: str | None = None,
+    height: int | None = None,
+    reference_url: str | None = None,
 ) -> None:
     """Executes the 3D statue pipeline."""
     STOP.clear()
+    check = get_statue_check()
     key = player.strip().lower()
     try:
         # 1. Player spot & clear preview
@@ -2050,12 +2125,17 @@ def run_statue(
         # 5. Get the mesh
         reference_png: bytes | None = None
         is_url = source.startswith("http://") or source.startswith("https://")
+        is_mesh = False
+
         if is_url:
             data = download_image(source, max_bytes=config.MESH_MAX_BYTES)
             if statue.is_glb(data):
+                is_mesh = True
                 glb_path = work_dir / "model.glb"
                 glb_path.write_bytes(data)
             else:
+                if reference_url is not None:
+                    raise statue.StatueError("A reference picture only goes with a mesh.")
                 if len(data) > config.IMAGE_MAX_BYTES:
                     raise statue.StatueError(
                         f"Image exceeds maximum size of {config.IMAGE_MAX_BYTES} bytes"
@@ -2080,26 +2160,43 @@ def run_statue(
                     prefix="[statue]",
                 )
         else:
+            is_mesh = True
             mesh_path = statue.find_mesh(source)
             if mesh_path is None:
                 raise statue.StatueError(f"Unknown mesh: {source}.")
             glb_path = work_dir / "model.glb"
             shutil.copyfile(mesh_path, glb_path)
 
+        if is_mesh and reference_url:
+            if not check:
+                send_message(
+                    rcon,
+                    player,
+                    "The AI check is off (!statuecheck on), so the picture was not used.",
+                    prefix="[statue]",
+                )
+            else:
+                try:  # links only: a chat command never reads local files
+                    reference_png = png_from_bytes(download_image(reference_url, max_bytes=config.IMAGE_MAX_BYTES))
+                except Exception as e:
+                    logger.warning("Reference picture failed for %s: %s", player, e)
+                    send_message(rcon, player, "Couldn't get the picture; building without the AI check.",
+                                 prefix="[statue]")
+
         if STOP.is_set():
             raise statue.StatueStopped("Stopped.")
 
         # 6. GLB to grid
-        grid, palette = statue_grid.glb_to_grid(glb_path, limits)
+        grid, palette = statue_grid.glb_to_grid(glb_path, limits, height=height)
 
         if STOP.is_set():
             raise statue.StatueStopped("Stopped.")
 
-        # 7. Colour check (only with reference image and config.STATUE_COLOUR_CHECK)
-        if reference_png is not None and config.STATUE_COLOUR_CHECK:
+        # 7. AI check (colours + shape report, only with reference image and check)
+        if reference_png is not None and check:
+            statue_png = statue_grid.views_png(grid, palette)
             send_message(rcon, player, "Checking the colours...", prefix="[statue]")
             try:
-                statue_png = statue_grid.views_png(grid, palette)
                 lines = statue_grid.block_lines(grid, palette)
                 allowed = sorted(pixelart.load_palette())
                 swaps = llm.colour_check(reference_png, statue_png, lines, allowed, stop=STOP)
@@ -2111,6 +2208,27 @@ def run_statue(
                 logger.warning("Colour check failed for %s: %s", player, e)
                 send_message(rcon, player, "Colour check failed; kept the model's colours.", prefix="[statue]")
 
+            if STOP.is_set():
+                raise statue.StatueStopped("Stopped.")
+
+            send_message(rcon, player, "Checking the shape...", prefix="[statue]")
+            try:
+                review_lines = llm.statue_review(reference_png, statue_png, stop=STOP)
+                for line in review_lines:
+                    send_message(rcon, player, f"AI check: {line}", prefix="[statue]")
+                if any(l.strip().rstrip(".").lower() != "looks right" for l in review_lines):
+                    send_message(
+                        rcon,
+                        player,
+                        "To fix the shape, generate it again or edit the mesh.",
+                        prefix="[statue]",
+                    )
+            except llm.LlmStopped:
+                raise
+            except Exception as e:
+                logger.warning("Shape check failed for %s: %s", player, e)
+                send_message(rcon, player, "Shape check failed; skipped.", prefix="[statue]")
+
         if STOP.is_set():
             raise statue.StatueStopped("Stopped.")
 
@@ -2119,8 +2237,11 @@ def run_statue(
         (work_dir / "preview.png").write_bytes(build.preview_png(grid, palette))
         (work_dir / "request.txt").write_text(
             f"Player: {player}\nSource: {source}\n"
-            f"Model: {(model or config.STATUE_MODEL) if reference_png is not None else 'none (mesh)'}\n"
-            f"Limits: {w}x{d}x{t}\n",
+            f"Reference: {reference_url or 'none'}\n"
+            f"Check: {'on' if check else 'off'}\n"
+            f"Model: {(model or config.STATUE_MODEL) if not is_mesh else 'none (mesh)'}\n"
+            f"Limits: {w}x{d}x{t}\n"
+            f"Height: {height or config.STATUE_HEIGHT}\n",
             encoding="utf-8",
         )
 
@@ -2144,12 +2265,16 @@ def run_offline_statue(
     source: str,
     model: str | None = None,
     size: int | None = None,
+    height: int | None = None,
+    reference_url: str | None = None,
+    check: bool | None = None,
 ) -> None:
     """Processes a 3D statue offline without RCON."""
     reach = config.MAX_SIDE
     if size is None:
         size = reach
     limits = (size, size, size)
+    check = check if check is not None else get_statue_check()
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     work_dir = config.WORK_DIR / f"{timestamp}-statue"
@@ -2157,13 +2282,17 @@ def run_offline_statue(
 
     reference_png: bytes | None = None
     is_url = source.startswith("http://") or source.startswith("https://")
+    is_mesh = False
 
     if is_url:
         data = download_image(source, max_bytes=config.MESH_MAX_BYTES)
         if statue.is_glb(data):
+            is_mesh = True
             glb_path = work_dir / "model.glb"
             glb_path.write_bytes(data)
         else:
+            if reference_url is not None:
+                raise statue.StatueError("A reference picture only goes with a mesh.")
             if len(data) > config.IMAGE_MAX_BYTES:
                 raise ValueError(
                     f"Image exceeds maximum size of {config.IMAGE_MAX_BYTES} bytes"
@@ -2173,34 +2302,55 @@ def run_offline_statue(
         p = Path(source)
         file_bytes = p.read_bytes()
         if p.suffix.lower() == ".glb" or statue.is_glb(file_bytes):
+            is_mesh = True
             glb_path = work_dir / "model.glb"
             shutil.copyfile(p, glb_path)
         else:
+            if reference_url is not None:
+                raise statue.StatueError("A reference picture only goes with a mesh.")
             if len(file_bytes) > config.IMAGE_MAX_BYTES:
                 raise ValueError(
                     f"Image exceeds maximum size of {config.IMAGE_MAX_BYTES} bytes"
                 )
             reference_png = png_from_bytes(file_bytes)
     else:
+        is_mesh = True
         mesh_path = statue.find_mesh(source)
         if mesh_path is None:
             raise statue.StatueError(f"Unknown mesh: {source}.")
         glb_path = work_dir / "model.glb"
         shutil.copyfile(mesh_path, glb_path)
 
-    if reference_png is not None:
+    if is_mesh and reference_url:
+        if not check:
+            print("The AI check is off (!statuecheck on), so the picture was not used.")
+        else:
+            try:
+                p = Path(reference_url)
+                if p.is_file():
+                    ref_data = p.read_bytes()
+                    if len(ref_data) > config.IMAGE_MAX_BYTES:
+                        raise ValueError(f"Image exceeds maximum size of {config.IMAGE_MAX_BYTES} bytes")
+                else:
+                    ref_data = download_image(reference_url, max_bytes=config.IMAGE_MAX_BYTES)
+                reference_png = png_from_bytes(ref_data)
+            except Exception as e:
+                logger.warning("Reference picture failed: %s", e)
+                print("Couldn't get the picture; building without the AI check.")
+
+    if not is_mesh:
         model_name = (model.lower() if model else None) or config.STATUE_MODEL
         print(f"Generating statue with {model_name}...")
         glb_path = statue.generate(model_name, reference_png, work_dir)
         saved_name = statue.save_mesh(glb_path)
         print(f"Saved as {saved_name}; !statue {saved_name} builds it again without using the quota.")
 
-    grid, palette = statue_grid.glb_to_grid(glb_path, limits)
+    grid, palette = statue_grid.glb_to_grid(glb_path, limits, height=height)
 
-    if reference_png is not None and config.STATUE_COLOUR_CHECK:
+    if reference_png is not None and check:
+        statue_png = statue_grid.views_png(grid, palette)
         print("Checking the colours...")
         try:
-            statue_png = statue_grid.views_png(grid, palette)
             lines = statue_grid.block_lines(grid, palette)
             allowed = sorted(pixelart.load_palette())
             swaps = llm.colour_check(reference_png, statue_png, lines, allowed)
@@ -2210,14 +2360,28 @@ def run_offline_statue(
             logger.warning("Colour check failed: %s", e)
             print("Colour check failed; kept the model's colours.")
 
+        print("Checking the shape...")
+        try:
+            review_lines = llm.statue_review(reference_png, statue_png)
+            for line in review_lines:
+                print(f"AI check: {line}")
+            if any(l.strip().rstrip(".").lower() != "looks right" for l in review_lines):
+                print("To fix the shape, generate it again or edit the mesh.")
+        except Exception as e:
+            logger.warning("Shape check failed: %s", e)
+            print("Shape check failed; skipped.")
+
     preview_bytes = build.preview_png(grid, palette)
     preview_path = work_dir / "preview.png"
     preview_path.write_bytes(preview_bytes)
 
     (work_dir / "request.txt").write_text(
         f"Source: {source}\n"
-        f"Model: {(model or config.STATUE_MODEL) if reference_png is not None else 'none (mesh)'}\n"
-        f"Limits: {limits}\n",
+        f"Reference: {reference_url or 'none'}\n"
+        f"Check: {'on' if check else 'off'}\n"
+        f"Model: {(model or config.STATUE_MODEL) if not is_mesh else 'none (mesh)'}\n"
+        f"Limits: {limits}\n"
+        f"Height: {height or config.STATUE_HEIGHT}\n",
         encoding="utf-8",
     )
     print(f"Preview: {preview_path}")
@@ -2261,6 +2425,20 @@ def handle_chat_line(
             send_message(rcon, player, f"Design review turned {review_arg.lower()}.")
         else:
             send_message(rcon, player, "Usage: !designreview on|off")
+        return
+
+    is_statuecheck_cmd, statuecheck_arg = parse_statuecheck_command(message)
+    if is_statuecheck_cmd:
+        if not is_op(player, config.OPS_FILE):
+            send_message(rcon, player, "Only ops can use !statuecheck.")
+            return
+        if statuecheck_arg is None:
+            send_message(rcon, player, f"Statue check: {'on' if get_statue_check() else 'off'}.")
+        elif statuecheck_arg.lower() in ("on", "off"):
+            save_setting("statue_check", statuecheck_arg.lower() == "on")
+            send_message(rcon, player, f"Statue check turned {statuecheck_arg.lower()}.")
+        else:
+            send_message(rcon, player, "Usage: !statuecheck on|off")
         return
 
     is_best_cmd, best_arg = parse_best_command(message)
@@ -2349,7 +2527,7 @@ def handle_chat_line(
         t.start()
         return
 
-    is_statue_cmd, statue_source, statue_model = parse_statue_command(message)
+    is_statue_cmd, statue_source, statue_model, statue_height, statue_reference = parse_statue_command(message)
     if is_statue_cmd:
         if not is_op(player, config.OPS_FILE):
             send_message(rcon, player, "Only ops can use !statue.", prefix="[statue]")
@@ -2359,7 +2537,7 @@ def handle_chat_line(
             send_message(
                 rcon,
                 player,
-                "Usage: !statue <image link> [model]  or  !statue <mesh>  or  !statue list",
+                "Usage: !statue <image link> [model] [height]  or  !statue <mesh> [image link] [height]  or  !statue list",
                 prefix="[statue]",
             )
             return
@@ -2398,7 +2576,14 @@ def handle_chat_line(
 
         def statue_worker():
             try:
-                run_statue(rcon, player, statue_source, model=statue_model)
+                run_statue(
+                    rcon,
+                    player,
+                    statue_source,
+                    model=statue_model,
+                    height=statue_height,
+                    reference_url=statue_reference,
+                )
             finally:
                 if build_lock is not None:
                     build_lock.release()
@@ -2548,6 +2733,9 @@ def main() -> None:
     parser.add_argument("--width", type=int, default=None, help="Width for pixel art")
     parser.add_argument("--statue", type=str, default=None, help="Image URL, file path, or mesh name for 3D statue")
     parser.add_argument("--model", type=str, default=None, help="Model name for 3D statue generation")
+    parser.add_argument("--height", type=int, default=None, help="Statue height in blocks (default config.STATUE_HEIGHT)")
+    parser.add_argument("--reference", type=str, default=None, help="Reference image URL or file path for statue AI check")
+    parser.add_argument("--check", action="store_true", help="Turn on the AI check of a statue against its picture for this run")
 
     args = parser.parse_args()
 
@@ -2562,9 +2750,23 @@ def main() -> None:
     if args.statue:
         if args.player:
             rcon = Rcon(*config.rcon_settings())
-            run_statue(rcon, args.player, args.statue, model=args.model)
+            run_statue(
+                rcon,
+                args.player,
+                args.statue,
+                model=args.model,
+                height=args.height,
+                reference_url=args.reference,
+            )
         else:
-            run_offline_statue(args.statue, model=args.model, size=args.size)
+            run_offline_statue(
+                args.statue,
+                model=args.model,
+                size=args.size,
+                height=args.height,
+                reference_url=args.reference,
+                check=True if args.check else None,
+            )
         return
 
     # Determine if running in one-shot mode or service mode

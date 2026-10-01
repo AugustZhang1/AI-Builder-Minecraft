@@ -33,6 +33,10 @@ chat line in logs/latest.log  (ops only)
 | `!move` | Moves the preview to where you stand, facing where you look |
 | `!place` | Builds the preview where it is (or your last design where you stand) |
 | `!pixelart <image link> [width]` | Builds the picture as a flat wall (no AI) |
+| `!statue <image or .glb link> [model] [height]` | Builds a 3D statue from a picture (image-to-3D model) or a mesh; height 40-256 blocks, default 180 |
+| `!statue <mesh link or name> <image link> [height]` | Builds a mesh and checks it against its picture (with `!statuecheck on`) |
+| `!statue list` | Lists the 3D models and saved meshes |
+| `!statuecheck [on\|off]` | Shows or switches the AI's colour and shape check of a statue |
 | `!designstop` | Stops the running build, or removes your preview |
 | `!designai [claude\|gemini]` | Shows or switches the AI |
 | `!designanim [on\|off]` | Shows or switches the builder crew animation |
@@ -128,6 +132,11 @@ The steps below are for Linux. Windows works too for running it by hand (use
    | `MCMCP_SERVER_DIR` | The Minecraft server folder | `./server` |
    | `MCMCP_WORK_DIR` | Where build files and settings are saved | `./work` |
    | `MCMCP_OPENSCAD` | Path to a native OpenSCAD binary | unset: use Docker |
+   | `HF_TOKEN` | Hugging Face token, needed for `!statue` from a picture | unset |
+   | `MCMCP_STATUE_DIR` | Where statue meshes are saved | `./statues` |
+   | `MCMCP_MODEL_DIR` | Where the face/eye detector models are downloaded | `./models` |
+
+   These can also go in a `.env` file in the project folder (see `.env.example`).
 
 6. **Try it offline** (no server needed). This designs, renders and voxelizes, and
    saves `design.scad`, `blocks.json` and `preview.png` in a folder under `work/`:
@@ -177,7 +186,7 @@ again in `server.properties`.
 
 Everything else is in `mcmcp/config.py`: the AI models, build size limits, placement
 speed, banned blocks (fluids, TNT, falling blocks, portals, spawners...), and the
-defaults for the animation, review and best-of-two options.
+defaults for the animation, review, best-of-two and statue options.
 
 ## License
 

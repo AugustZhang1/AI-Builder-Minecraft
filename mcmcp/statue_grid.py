@@ -15,10 +15,10 @@ from scipy.spatial import cKDTree
 import trimesh
 
 try:
-    from . import build, config, llm, pixelart
+    from . import build, config, llm, pixelart, statue_eyes
     from .build import BuildError
 except ImportError:
-    from mcmcp import build, config, llm, pixelart
+    from mcmcp import build, config, llm, pixelart, statue_eyes
     from mcmcp.build import BuildError
 
 SURFACE_SPACING = 0.3  # blocks between surface samples, so every bit of surface lands in a block
@@ -38,6 +38,7 @@ def glb_to_grid(
       surfaces (cloth, ribbons, staffs) and meshes that aren't watertight still come out solid.
     - Each block takes the average colour of its nearest surface samples, matched to the nearest
       block in Lab (pixelart's palette). A mesh without texture or colours is all white concrete.
+    - With config.STATUE_EYES, statue_eyes paints the eyes it finds on the front (sharper than the average).
     Raises BuildError if the file can't be read or has no geometry."""
     height = height or config.STATUE_HEIGHT
     try:
@@ -46,6 +47,7 @@ def glb_to_grid(
         raise BuildError(f"Couldn't read the mesh: {e}") from e
 
     meshes: list[trimesh.Trimesh] = []
+    parts: list[trimesh.Trimesh] = []  # with their own texture, for statue_eyes' front render
     for name in scene.graph.nodes_geometry:
         tf, gname = scene.graph[name]
         g = scene.geometry[gname]
@@ -53,6 +55,8 @@ def glb_to_grid(
             continue
         g = g.copy()
         g.apply_transform(tf)
+        if config.STATUE_EYES:
+            parts.append(g.copy())
         if g.visual.kind == "texture":
             g.visual = g.visual.to_color()  # sample the texture at each vertex
         meshes.append(g)
@@ -76,10 +80,13 @@ def glb_to_grid(
     m.update_faces(keep_vertex[w.faces].all(axis=1))
     m.remove_unreferenced_vertices()
 
-    m.apply_transform(trimesh.transformations.rotation_matrix(np.pi / 2, [1, 0, 0]))  # Y-up -> Z-up
-    m.apply_translation(-m.bounds[0])
+    rotate = trimesh.transformations.rotation_matrix(np.pi / 2, [1, 0, 0])  # Y-up -> Z-up
+    m.apply_transform(rotate)
+    shift = -m.bounds[0]
+    m.apply_translation(shift)
     ext = np.maximum(m.extents, 1e-9)
-    m.apply_scale(min(height / ext[2], limits[0] / ext[0], limits[1] / ext[1], limits[2] / ext[2]))
+    scale = min(height / ext[2], limits[0] / ext[0], limits[1] / ext[1], limits[2] / ext[2])
+    m.apply_scale(scale)
 
     # Surface samples (and the vertices, for slivers) mark their blocks; then fill enclosed space.
     pts, fi = trimesh.sample.sample_surface_even(m, int(m.area / SURFACE_SPACING**2) + 1000)
@@ -105,7 +112,14 @@ def glb_to_grid(
     remap[used] = np.arange(1, len(used) + 1)
     grid = np.zeros(dims, np.uint8)
     grid[tuple(idxs.T)] = remap[idx]
-    return grid, ["minecraft:air"] + [blocks[i] for i in used]
+    palette = ["minecraft:air"] + [blocks[i] for i in used]
+    if config.STATUE_EYES:
+        to_grid = (trimesh.transformations.scale_matrix(scale)
+                   @ trimesh.transformations.translation_matrix(shift) @ rotate)
+        for p in parts:
+            p.apply_transform(to_grid)
+        grid, palette, _ = statue_eyes.paint_eyes(grid, palette, parts)
+    return grid, palette
 
 
 def block_lines(grid: np.ndarray, palette: list[str]) -> list[str]:

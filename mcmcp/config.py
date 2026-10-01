@@ -100,7 +100,9 @@ STATUE_MODEL = "hunyuan"           # default model (tencent/Hunyuan3D-2.1)
 STATUE_HEIGHT = 180                # blocks tall by default (capped by the world limits); more height, more detail
 STATUE_TIMEOUT = 600               # seconds to wait for model generation
 MESH_MAX_BYTES = 50_000_000        # max download size for .glb meshes (50 MB)
-STATUE_COLOUR_CHECK = True         # post-generation colour comparison with Claude
+STATUE_CHECK = False               # AI check of a statue against its picture (colours + shape report); !statuecheck on|off
+STATUE_EYES = True                 # find the eyes on the mesh's front and paint them onto the blocks
+MODEL_DIR = Path(os.environ.get("MCMCP_MODEL_DIR", ROOT / "models"))  # face/eye detector .onnx files (downloaded once)
 
 
 def server_properties() -> dict[str, str]:
