@@ -15,7 +15,7 @@ See [overview.md](overview.md) for how it works in detail.
 
 **`!design a pirate ship`**: one sentence, previewed, then placed in seconds.
 
-https://github.com/user-attachments/assets/0031922c-8108-4da6-8972-4481493f88bd
+https://github.com/user-attachments/assets/034682f0-e204-45f1-8169-7d78290a1be5
 
 **`!design me a statue of a king`**, then `!designfix make it out of diamonds instead of gold`.
 
@@ -23,7 +23,7 @@ https://github.com/user-attachments/assets/1d69f677-5388-4626-8e38-76ea43da73e3
 
 **`!statue <picture>`**: a 3D statue of 1.4 million blocks from a single picture.
 
-https://github.com/user-attachments/assets/034682f0-e204-45f1-8169-7d78290a1be5
+https://github.com/user-attachments/assets/0031922c-8108-4da6-8972-4481493f88bd
 
 ## How it works
 
