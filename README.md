@@ -1,5 +1,9 @@
 # AI-Builder-Minecraft
 
+**A free, open-source AI builder for Minecraft.** Type what you want in chat, or paste
+a picture, and AI (Claude or Gemini) designs it and builds it in your world: houses,
+castles, ships, statues from a photo, and pixel art. No mods or plugins needed.
+
 An in-game AI builder for a Minecraft Java server. An op types `!design <description>`
 in chat (optionally with an image link as a reference), an AI designs the build as
 OpenSCAD code, the code is rendered to meshes, the meshes are turned into blocks, and
