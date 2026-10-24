@@ -26,10 +26,10 @@ import numpy as np
 from PIL import Image
 
 try:
-    from . import animate, build, config, figure, ghost, llm, pixelart, preview, statue, statue_grid
+    from . import animate, build, config, figure, ghost, interior, llm, pixelart, preview, statue, statue_grid
     from .rcon import Rcon, RconError
 except ImportError:
-    from mcmcp import animate, build, config, figure, ghost, llm, pixelart, preview, statue, statue_grid
+    from mcmcp import animate, build, config, figure, ghost, interior, llm, pixelart, preview, statue, statue_grid
     from mcmcp.rcon import Rcon, RconError
 
 logger = logging.getLogger("mcmcp")
@@ -78,6 +78,7 @@ HELP_LINES = (
     "!design <description> - the AI designs it and shows you a preview to place",
     "!design <image link> <description> - the same, using the picture as a reference",
     "!designfix <changes> - the AI changes your last design, e.g. !designfix make the roof taller",
+    "!interior [what you want] - the AI furnishes the inside of your last design, e.g. !interior a cozy two-room cottage",
     "!move - moves the preview to where you stand, facing where you look",
     "!place - builds the preview where it is (or your last design where you stand)",
     "!pixelart <image link> [width] - builds the picture as a flat wall (no AI)",
@@ -474,8 +475,8 @@ def room_boxes(
         mask[:, :, 0] = 0
     boxes = build.boxes(mask, 32768)
     for db in dboxes:
-        x1, y1, z1, x2, y2, z2, _block = db
-        if z2 < 1:
+        x1, y1, z1, x2, y2, z2, block = db
+        if z2 < 1 or block == "minecraft:air":
             continue
         cz1 = max(1, z1)
         boxes.append((x1, y1, cz1, x2, y2, z2, 1))
@@ -740,7 +741,7 @@ def place_details(
                 rotated_block,
                 reply.strip(),
             )
-        else:
+        elif block != "minecraft:air":  # air fills cut openings, they are not blocks
             placed += vol
 
         if pacer.wait(vol):
@@ -764,7 +765,11 @@ def load_blocks_data(
 
 
 def detail_block_count(dboxes: list[tuple[int, int, int, int, int, int, str]]) -> int:
-    return sum((x2 - x1 + 1) * (y2 - y1 + 1) * (z2 - z1 + 1) for x1, y1, z1, x2, y2, z2, _ in dboxes)
+    return sum(
+        (x2 - x1 + 1) * (y2 - y1 + 1) * (z2 - z1 + 1)
+        for x1, y1, z1, x2, y2, z2, block in dboxes
+        if block != "minecraft:air"
+    )
 
 
 def voxelize_design(
@@ -1296,7 +1301,7 @@ def show_preview(
         rcon,
         player,
         "Type !place to build it there, !move to move it to where you stand, "
-        "!designfix <changes> to change it, or !designstop to remove it.",
+        "!designfix <changes> to change it, !interior to furnish the inside, or !designstop to remove it.",
     )
 
 
@@ -1434,6 +1439,81 @@ def run_fix(rcon: Rcon, player: str, changes: str) -> None:
     except Exception as e:
         logger.exception("Fix failed for player %s: %s", player, e)
         send_message(rcon, player, f"Fix failed: {_reason(e)}")
+
+
+def run_interior(rcon: Rcon, player: str, request: str) -> None:
+    """Asks Claude to furnish the inside of the player's last design, then shows the new
+    version as a preview where the old preview was (or where they stand)."""
+    STOP.clear()
+    try:
+        key = player.strip().lower()
+        design = LAST_DESIGNS.get(key)
+        if design is None:
+            send_message(rcon, player, "No design to furnish. Use !design first.")
+            return
+        src = LAST_SOURCES.get(key)  # statues have none
+        description = src.description if src else ""
+        request = request or "Furnish it to suit the build."
+        send_fn = lambda msg: send_message(rcon, player, msg)
+        send_message(rcon, player, "Redoing the inside with Claude...")  # whatever !designai says
+        inside = interior.analyze(*design)
+        if isinstance(inside, str):
+            send_message(rcon, player, inside)
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        out_dir = config.WORK_DIR / f"{timestamp}-{player}-interior"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "interior-request.txt").write_text(
+            f"Player: {player}\nRequest: {request}\nFrom: {src.dir if src else '-'}\n", encoding="utf-8"
+        )
+        maps = interior.maps_text(inside)
+        (out_dir / "interior-maps.txt").write_text(maps, encoding="utf-8")
+        preview_png = preview.blocks_png(*build.stamp_details(*design))
+
+        heartbeat = Heartbeat(send_fn, "Claude", config.HEARTBEAT_SECONDS)
+        narrator = Narrator(send_fn, on_first=heartbeat.stop)
+        heartbeat.start()
+        try:
+            edits, raw = llm.interior(
+                description, request, maps, preview_png, on_text=narrator.feed, stop=STOP, work_dir=out_dir
+            )
+        finally:
+            heartbeat.stop()
+        narrator.flush()
+        (out_dir / "response.txt").write_text(raw, encoding="utf-8")
+
+        new = interior.apply(*design, inside, edits)
+        if new is None:
+            send_message(rcon, player, "The AI left the inside as it is.")
+            return
+        floating, far = interior.checks(*new, inside, edits)
+        logger.info("Interior checks for %s: %d floating blocks, %d edit cells far outside", player, floating, far)
+
+        # Previews never fail a build.
+        for name, make in (
+            ("preview.png", lambda: preview.blocks_png(*build.stamp_details(*new))),
+            ("cutaway.png", lambda: interior.cutaways_png(*new, inside.free)),
+        ):
+            try:
+                (out_dir / name).write_bytes(make())
+            except Exception as e:
+                logger.warning("Failed to write %s: %s", name, e)
+        LAST_DESIGNS[key] = new  # LAST_SOURCES stays: !designfix reads the design's own response.txt
+
+        if STOP.is_set():
+            send_message(rcon, player, "Stopped. Type !place to build it.")
+            return
+        p = PREVIEWS.get(key)
+        origin, facing, dim = (p.origin, p.facing, p.dim) if p is not None else player_spot(rcon, player)
+        show_preview(rcon, player, new, origin, facing, dim)
+        send_message(rcon, player, "Note: !designfix starts again from the design and drops this inside.")
+
+    except llm.LlmStopped:
+        send_message(rcon, player, "Stopped.")
+    except Exception as e:
+        logger.exception("Interior failed for player %s: %s", player, e)
+        send_message(rcon, player, f"Interior failed: {_reason(e)}")
 
 
 def run_build(
@@ -1615,6 +1695,9 @@ def run_offline_build(
     blocks_file: str | None = None,
     ai: str | None = None,
     best: bool = False,
+    interior_request: str | None = None,
+    interior_reply: str | None = None,
+    player: str | None = None,
 ) -> None:
     """Executes design, rendering, voxelization, and previews without RCON, printing results and timings.
     best: two designs at the same time and the AI keeps the better one."""
@@ -1696,6 +1779,9 @@ def run_offline_build(
                 reviewed = True
                 scad, blocks, mix, details, grid, palette, dboxes, skipped = rev
 
+    if interior_request is not None or interior_reply:
+        offline_interior(description, interior_request or "", (grid, palette, dboxes), build_dir, interior_reply, player)
+
     t_total = time.time() - t_total_start
     total_blocks = int(np.count_nonzero(grid)) + detail_block_count(dboxes)
 
@@ -1719,6 +1805,45 @@ def run_offline_build(
         if get_review() and not (scad_file and blocks_file):
             print(f"  Review:   {t_review:.2f}s")
     print(f"  Total:    {t_total:.2f}s")
+
+
+def offline_interior(
+    description: str,
+    request: str,
+    design: tuple[np.ndarray, list[str], list[tuple[int, int, int, int, int, int, str]]],
+    build_dir: Path,
+    reply_file: str | None = None,
+    player: str | None = None,
+) -> None:
+    """The !interior steps without chat: one AI call (or a saved reply), files in build_dir,
+    the checks printed, and with a player the result placed on the local server."""
+    inside = interior.analyze(*design)
+    if isinstance(inside, str):
+        print(inside)
+        return
+    maps = interior.maps_text(inside)
+    (build_dir / "interior-maps.txt").write_text(maps, encoding="utf-8")
+    if reply_file:
+        edits = llm.parse_interior(Path(reply_file).read_text(encoding="utf-8"))
+    else:
+        preview_png = preview.blocks_png(*build.stamp_details(*design))
+        edits, raw = llm.interior(
+            description, request or "Furnish it to suit the build.", maps, preview_png, work_dir=build_dir
+        )
+        (build_dir / "interior-response.txt").write_text(raw, encoding="utf-8")
+    new = interior.apply(*design, inside, edits)
+    if new is None:
+        print("The AI left the inside as it is.")
+        return
+    floating, far = interior.checks(*new, inside, edits)
+    (build_dir / "interior-preview.png").write_bytes(preview.blocks_png(*build.stamp_details(*new)))
+    (build_dir / "cutaway.png").write_bytes(interior.cutaways_png(*new, inside.free))
+    print(f"Interior: {floating} floating blocks, {far} edit cells far outside the shell")
+    print("Interior files: interior-maps.txt, interior-preview.png, cutaway.png")
+    if player:
+        rcon = Rcon(*config.rcon_settings())
+        origin, facing, dim = player_spot(rcon, player)
+        place_design(rcon, player, new, origin, facing, dim, time.time())
 
 
 def tail_log(log_path: Path) -> Iterator[str]:
@@ -2592,6 +2717,28 @@ def handle_chat_line(
         t.start()
         return
 
+    is_interior_cmd, interior_arg = _parse_word_command(message, "!interior")
+    if is_interior_cmd:
+        if not is_op(player, config.OPS_FILE):
+            send_message(rcon, player, "Only ops can use !interior.")
+            return
+        if player.strip().lower() not in LAST_DESIGNS:
+            send_message(rcon, player, "No design to furnish. Use !design first.")
+            return
+        if build_lock is not None and not build_lock.acquire(blocking=False):
+            send_message(rcon, player, "A build is already running. Try again when it finishes.")
+            return
+
+        def interior_worker():
+            try:
+                run_interior(rcon, player, interior_arg or "")
+            finally:
+                if build_lock is not None:
+                    build_lock.release()
+
+        threading.Thread(target=interior_worker, daemon=True).start()
+        return
+
     is_fix_cmd, fix_arg = _parse_word_command(message, "!designfix")
     if is_fix_cmd:
         if not is_op(player, config.OPS_FILE):
@@ -2729,6 +2876,8 @@ def main() -> None:
         action="store_true",
         help="Make two designs and keep the better one (about twice the AI usage); default: the !designbest setting with --player, off otherwise",
     )
+    parser.add_argument("--interior", type=str, default=None, help="With --scad/--blocks: furnish the inside with one AI call")
+    parser.add_argument("--interior-reply", type=str, default=None, help="With --scad/--blocks: replay a saved interior reply (no AI call)")
     parser.add_argument("--pixelart", type=str, default=None, help="Image URL or file path for pixel art")
     parser.add_argument("--width", type=int, default=None, help="Width for pixel art")
     parser.add_argument("--statue", type=str, default=None, help="Image URL, file path, or mesh name for 3D statue")
@@ -2774,7 +2923,7 @@ def main() -> None:
 
     if is_one_shot:
         description = args.once if args.once is not None else ""
-        if args.player:
+        if args.player and args.interior is None and not args.interior_reply:
             rcon = Rcon(*config.rcon_settings())
             scad_override = Path(args.scad).read_text(encoding="utf-8") if args.scad else None
             blocks_override = None
@@ -2800,6 +2949,9 @@ def main() -> None:
                 blocks_file=args.blocks,
                 ai=args.ai,
                 best=args.best,
+                interior_request=args.interior,
+                interior_reply=args.interior_reply,
+                player=args.player,
             )
         return
 

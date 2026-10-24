@@ -85,6 +85,10 @@ FILL_MAX_VOLUME = 4096             # blocks per /fill command (hard game limit i
 BLOCKS_PER_SECOND = 20000
 MIN_COMMAND_DELAY = 0.002          # seconds between placement commands
 
+# !interior (the AI redoes the inside of a design).
+INTERIOR_SKIN = 1                  # blocks of the outer shell that stay as they are
+INTERIOR_MAX_CELLS = 100_000       # largest map crop (cells) sent to the AI
+
 # !pixelart (no AI). Sizes come from the image and the free space; these are sanity caps.
 PIXELART_MAX_SIDE = 512            # px, longest side after sprite detection
 PIXELART_MIN_WIDTH = 8

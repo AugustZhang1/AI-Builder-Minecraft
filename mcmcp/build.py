@@ -864,6 +864,9 @@ def stamp_details(
             continue
 
         base_id = block.split("[", 1)[0]
+        if base_id == "minecraft:air":  # cuts a hole
+            new_grid[cx1 : cx2 + 1, cy1 : cy2 + 1, cz1 : cz2 + 1] = 0
+            continue
         entry = block if base_id.endswith(("_slab", "_stairs")) else base_id
         if entry not in palette_map:
             if len(new_palette) >= 256:

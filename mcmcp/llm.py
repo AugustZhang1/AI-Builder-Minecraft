@@ -190,6 +190,27 @@ blockiness, and parts the picture does not show.
 Reply with up to 5 lines, each starting with "- ", most important first, each one short and concrete (what and where,
 e.g. "- The right hand is missing."). If the shape matches, reply only "- Looks right."."""
 
+INTERIOR_TEXT = """You furnish the inside of a Minecraft build.
+You get the build's description, the player's request, a picture of the outside, and one text map per layer
+(z up, z = 0 is ground level) in grid coordinates.
+Map symbols: a letter is a locked block of the outer shell (see the legend), . is outside, o is a gap in the shell
+(a door or window opening), _ is inside space that will be empty: whatever was there is removed, so it is all yours.
+The top row of a map is north (+Y, away from the player); the bottom row is the front (y = 0, where the player stands).
+The ground floor (z = 0) is kept; replace it with edits if the rooms need another floor.
+Build floors, ceilings, internal walls, stairs between floors with holes cut for them, doors, furniture and lights. Connect the rooms to the o openings. Nothing floats. Leave the shell as it is,
+except to fix it: you may add a missing door, a window or a stairwell (edits may replace shell blocks;
+minecraft:air cuts an opening).
+Write block states as if the player faces north: north = +Y, south = -Y (the front), east = +X, west = -X.
+A door is one entry at its lower block (the upper half is added for you). A bed is two entries: part=foot, and
+part=head on the cell the bed faces. Use only real Minecraft block ids and states. No fluids, fire, TNT, sand,
+gravel, concrete powder, command blocks, spawners, portals or bedrock.
+Edits are placed in order and a later edit replaces an earlier one (e.g. a floor, then minecraft:air for a stair hole).
+Order the edits: floors, walls and stairs first, then furniture, then torches, lanterns and carpets.
+While working, write a few short progress lines starting with "// > " (they are shown to the player).
+Reply with ONE ```json block: {"edits": [[x1,y1,z1,x2,y2,z2,"minecraft:block[state]"], [x,y,z,"minecraft:block"], ...]}
+in grid coordinates (boxes are inclusive).
+If the build has no room for an inside (a statue, a solid sculpture), reply {"edits": []} and one line saying why."""
+
 
 def _build_gemini_user_text(
     description: str,
@@ -613,8 +634,9 @@ def parse_mix(raw: Any) -> dict[str, dict[str, float]]:
     return result
 
 
-def parse_details(raw: Any) -> list[tuple[int, int, int, int, int, int, str]]:
-    """Parse and validate detail blocks/boxes. Invalid entries are dropped and logged."""
+def parse_details(raw: Any, max_volume: int | None = 64) -> list[tuple[int, int, int, int, int, int, str]]:
+    """Parse and validate detail blocks/boxes. Invalid entries are dropped and logged.
+    max_volume is the biggest box allowed (None = no limit)."""
     if not isinstance(raw, list):
         logger.warning("Invalid details: expected list, got %s", type(raw).__name__)
         return []
@@ -663,8 +685,8 @@ def parse_details(raw: Any) -> list[tuple[int, int, int, int, int, int, str]]:
         sz1, sz2 = min(z1, z2), max(z1, z2)
 
         volume = (sx2 - sx1 + 1) * (sy2 - sy1 + 1) * (sz2 - sz1 + 1)
-        if volume > 64:
-            logger.warning("Dropping detail entry: box volume %d exceeds 64 blocks", volume)
+        if max_volume is not None and volume > max_volume:
+            logger.warning("Dropping detail entry: box volume %d exceeds %d blocks", volume, max_volume)
             continue
 
         result.append((sx1, sy1, sz1, sx2, sy2, sz2, clean_block))
@@ -875,6 +897,69 @@ def pick(
         raise
     except Exception as exc:
         raise LlmError(f"Pick failed: {exc}") from exc
+
+
+def interior(
+    description: str,
+    request: str,
+    maps_text: str,
+    preview_png: bytes,
+    on_text: Callable[[str], Any] | None = None,
+    stop: threading.Event | None = None,
+    work_dir: Path | None = None,
+    timeout: float = config.CLAUDE_TIMEOUT,
+) -> tuple[list[tuple[int, int, int, int, int, int, str]], str]:
+    """Asks Claude CLI to furnish the inside of a build from text maps of its layers.
+
+    Returns (edits, raw reply). Raises LlmError if the reply has no valid ```json
+    block with an "edits" list.
+    """
+    work = work_dir or _CLI_WORKDIR
+    work.mkdir(parents=True, exist_ok=True)
+
+    prompt_file = work / "interior.md"
+    prompt_file.write_text(INTERIOR_TEXT, encoding="utf-8")
+    cmd = _cli_command(prompt_file)
+
+    text = (
+        f"Description of the build:\n{description.strip()}\n\n"
+        f"The player's request:\n{request.strip()}\n\n"
+        f"{maps_text}"
+    )
+    content: list[dict[str, Any]] = [
+        {"type": "text", "text": "The outside of the build:"},
+        _image_part(preview_png),
+        {"type": "text", "text": text},
+    ]
+    msg = {"type": "user", "message": {"role": "user", "content": content}}
+    stdin_payload = json.dumps(msg) + "\n"
+
+    try:
+        chunks: list[str] = []
+        for chunk in _run_cli(cmd, stdin_payload, work, timeout, provider="claude", stop=stop):
+            chunks.append(chunk)
+            if on_text:
+                on_text(chunk)
+        reply = "".join(chunks)
+        return parse_interior(reply), reply
+    except LlmError:
+        raise
+    except Exception as exc:
+        raise LlmError(f"Interior failed: {exc}") from exc
+
+
+def parse_interior(reply: str) -> list[tuple[int, int, int, int, int, int, str]]:
+    """The edits in the last ```json block of an interior reply. Raises LlmError if there is none."""
+    blocks = [c for lang, c in FENCE_RE.findall(reply) if lang.lower() == "json"]
+    if not blocks:
+        raise LlmError("No ```json block in the reply")
+    try:
+        data = json.loads(blocks[-1])
+    except ValueError as exc:
+        raise LlmError(f"Invalid JSON in the reply: {exc}") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("edits"), list):
+        raise LlmError('The JSON block has no "edits" list')
+    return parse_details(data["edits"], max_volume=None)
 
 
 def parse_swaps(text: str) -> dict[str, str]:
