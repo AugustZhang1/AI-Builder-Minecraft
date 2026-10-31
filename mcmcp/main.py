@@ -26,10 +26,10 @@ import numpy as np
 from PIL import Image
 
 try:
-    from . import animate, build, config, figure, ghost, interior, llm, pixelart, preview, statue, statue_grid
+    from . import animate, build, config, figure, ghost, interior, llm, pixelart, preview, saves, statue, statue_grid
     from .rcon import Rcon, RconError
 except ImportError:
-    from mcmcp import animate, build, config, figure, ghost, interior, llm, pixelart, preview, statue, statue_grid
+    from mcmcp import animate, build, config, figure, ghost, interior, llm, pixelart, preview, saves, statue, statue_grid
     from mcmcp.rcon import Rcon, RconError
 
 logger = logging.getLogger("mcmcp")
@@ -81,6 +81,9 @@ HELP_LINES = (
     "!interior [what you want] - the AI furnishes the inside of your last design, e.g. !interior a cozy two-room cottage",
     "!move - moves the preview to where you stand, facing where you look",
     "!place - builds the preview where it is (or your last design where you stand)",
+    "!save <name> - saves your last design for later",
+    "!load <name> - loads a saved design and shows its preview",
+    "!saves - lists your saved designs",
     "!pixelart <image link> [width] - builds the picture as a flat wall (no AI)",
     "!statue <image or mesh> [model] [height] - builds a 3D statue (height 40-256 blocks, default 180)",
     "!statue <mesh link or name> <image link> [height] - a mesh with its picture, for !statuecheck",
@@ -1372,6 +1375,23 @@ def run_move(rcon: Rcon, player: str) -> None:
     except Exception as e:
         logger.exception("Move failed for player %s: %s", player, e)
         send_message(rcon, player, f"Move failed: {_reason(e)}")
+
+
+def run_load(rcon: Rcon, player: str, name: str) -> None:
+    """Loads a saved design and shows it at the player's current spot."""
+    key = player.strip().lower()
+    try:
+        design = saves.load(name)
+    except FileNotFoundError:
+        send_message(rcon, player, f"No saved design called {name}.")
+        return
+    except (ValueError, OSError):
+        send_message(rcon, player, "That saved design could not be loaded.")
+        return
+
+    LAST_DESIGNS[key] = design
+    LAST_SOURCES.pop(key, None)
+    run_move(rcon, player)
 
 
 def run_fix(rcon: Rcon, player: str, changes: str) -> None:
@@ -2879,6 +2899,81 @@ def handle_chat_line(
                     build_lock.release()
 
         threading.Thread(target=fix_worker, daemon=True).start()
+        return
+
+    is_save_cmd, save_arg = _parse_word_command(message.lower(), "!save")
+    if is_save_cmd:
+        if not is_op(player, config.OPS_FILE):
+            send_message(rcon, player, "Only ops can use !save.")
+            return
+        if save_arg is None:
+            send_message(rcon, player, "Usage: !save <name>")
+            return
+        if not saves.valid_name(save_arg):
+            send_message(rcon, player, "Invalid name. Use lowercase letters, digits, _ or -, up to 32 characters.")
+            return
+        design = LAST_DESIGNS.get(player.strip().lower())
+        if design is None:
+            send_message(rcon, player, "No design to save. Use !design first.")
+            return
+        try:
+            replaced = saves.save(save_arg, design)
+        except OSError:
+            logger.exception("Could not save design %s", save_arg)
+            send_message(rcon, player, "Could not save that design.")
+            return
+        send_message(
+            rcon,
+            player,
+            f"Saved design '{save_arg}'" + (" (overwrote the old save)." if replaced else "."),
+        )
+        return
+
+    is_load_cmd, load_arg = _parse_word_command(message.lower(), "!load")
+    if is_load_cmd:
+        if not is_op(player, config.OPS_FILE):
+            send_message(rcon, player, "Only ops can use !load.")
+            return
+        if load_arg is None:
+            send_message(rcon, player, "Usage: !load <name>")
+            return
+        if not saves.valid_name(load_arg):
+            send_message(rcon, player, "Invalid name. Use lowercase letters, digits, _ or -, up to 32 characters.")
+            return
+        if build_lock is not None and not build_lock.acquire(blocking=False):
+            send_message(rcon, player, "A build is already running. Try again when it finishes.")
+            return
+
+        def load_worker():
+            try:
+                run_load(rcon, player, load_arg)
+            finally:
+                if build_lock is not None:
+                    build_lock.release()
+
+        threading.Thread(target=load_worker, daemon=True).start()
+        return
+
+    is_saves_cmd, saves_arg = _parse_word_command(message, "!saves")
+    if is_saves_cmd:
+        if not is_op(player, config.OPS_FILE):
+            send_message(rcon, player, "Only ops can use !saves.")
+            return
+        if saves_arg is not None:
+            send_message(rcon, player, "Usage: !saves")
+            return
+        try:
+            names = saves.list_saved()
+        except OSError:
+            send_message(rcon, player, "Could not list saved designs.")
+            return
+        if not names:
+            send_message(rcon, player, "Saved designs: none.")
+            return
+        line = "Saved designs: " + ", ".join(names)
+        if len(line) > 240:
+            line = line[:230].rsplit(", ", 1)[0] + ", ..."
+        send_message(rcon, player, line)
         return
 
     if parse_move_command(message):
