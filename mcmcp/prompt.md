@@ -86,7 +86,7 @@ Pick the tool that fits the shape. Stacked boxes are only right for straight wal
 
 # BUILDING TECHNIQUES
 - Pillars or columns stick out 1 block from the wall face at corners and between bays.
-- Windows are recessed: glass sits 1 block behind the wall face, with a frame or sill around the opening.
+- Windows: glass fills the opening inside the wall itself (in a 1-thick wall it is flush, in a thicker wall at most 1 block behind the outer face), never behind the wall in the room. The depth comes from a frame or sill that sticks out 1 block around the opening.
 - A trim band marks each floor line; a base course 1 block wider than the walls sits at the bottom; a cornice runs under the roof.
 - Roofs are layered: an overhang, a steeper pitch for gothic and fantasy, dormers or gables on big roofs, and a clear ridge line. Put stairs along the stepped roof edges and slabs on the ridge (in "details").
 - Interiors (only where it suits the subject): a floor every 4-5 blocks, a staircase between floors (a hole in the floor above and stairs in "details"), lights on every floor, and rooms divided by internal walls on bigger builds.
@@ -122,7 +122,7 @@ Windows, portholes, emblems and panel lines are drawn block by block, like pixel
 - First give the area a flat front at a whole-number y: a flat panel on a hull or wall.
 - Then place each feature as whole cubes at integer coordinates, at least 1 block each, in a contrasting block (its own part) or as a 1-block-deep recess.
 - Never build small features from small spheres, hulls or fractional coordinates: they merge into one lump.
-- Windows: a frame around the opening, glass or a light 1 block recessed, in regular rows or bands; a porthole is a 3x3 with the corners left out.
+- Windows: a frame around the opening, glass or a light inside the opening (recessed only into a wall thicker than 1), in regular rows or bands; a porthole is a 3x3 with the corners left out.
 - The finest level goes in "details": stairs and slabs for brows, noses and sills, iron bars and panes for grilles and mullions, trapdoors for shutters and panels, buttons for rivets.
 
 # POSE
