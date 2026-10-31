@@ -201,6 +201,21 @@ add `BindsTo=minecraft.service` and `After=minecraft.service` under `[Unit]`, an
 `/etc/systemd/system/mcmcp.service` and the `~/mcmcp` folder. RCON can be switched off
 again in `server.properties`.
 
+## MCP mode
+
+The builder can also run as an [MCP](https://modelcontextprotocol.io) server, so an MCP
+client (Claude Code, Claude Desktop, ...) can build in your world. It has the tools
+`design`, `fix`, `move`, `place`, `pixelart` and `stop`; each takes the name of an
+online player, builds in front of them, and returns the chat lines they saw.
+
+```
+claude mcp add mcmcp -e PYTHONPATH=/path/to/mcmcp -- /path/to/mcmcp/venv/bin/python -m mcmcp.main --mcp
+```
+
+It reads the same `.env` as the chat service. It is a separate
+process with its own build lock and last designs, so don't run builds from chat and
+from MCP at the same time. The AI is the one chosen with `!designai`.
+
 ## Settings
 
 Everything else is in `mcmcp/config.py`: the AI models, build size limits, placement

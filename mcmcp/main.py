@@ -3129,8 +3129,15 @@ def main() -> None:
     parser.add_argument("--height", type=int, default=None, help="Statue height in blocks (default config.STATUE_HEIGHT)")
     parser.add_argument("--reference", type=str, default=None, help="Reference image URL or file path for statue AI check")
     parser.add_argument("--check", action="store_true", help="Turn on the AI check of a statue against its picture for this run")
+    parser.add_argument("--mcp", action="store_true", help="Run as an MCP server over stdio (MCP mode)")
 
     args = parser.parse_args()
+
+    if args.mcp:
+        from mcmcp import mcp_server
+
+        mcp_server.run()
+        return
 
     if args.pixelart:
         if args.player:
