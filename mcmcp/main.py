@@ -26,10 +26,10 @@ import numpy as np
 from PIL import Image
 
 try:
-    from . import animate, build, config, figure, ghost, interior, llm, pixelart, preview, saves, statue, statue_grid
+    from . import animate, build, config, figure, ghost, interior, llm, pixelart, preview, saves, schem, statue, statue_grid
     from .rcon import Rcon, RconError
 except ImportError:
-    from mcmcp import animate, build, config, figure, ghost, interior, llm, pixelart, preview, saves, statue, statue_grid
+    from mcmcp import animate, build, config, figure, ghost, interior, llm, pixelart, preview, saves, schem, statue, statue_grid
     from mcmcp.rcon import Rcon, RconError
 
 logger = logging.getLogger("mcmcp")
@@ -84,6 +84,7 @@ HELP_LINES = (
     "!save <name> - saves your last design for later",
     "!load <name> - loads a saved design and shows its preview",
     "!saves - lists your saved designs",
+    "!export - saves your last design as a schematic file (.schem)",
     "!pixelart <image link> [width] - builds the picture as a flat wall (no AI)",
     "!statue <image or mesh> [model] [height] - builds a 3D statue (height 40-256 blocks, default 180)",
     "!statue <mesh link or name> <image link> [height] - a mesh with its picture, for !statuecheck",
@@ -195,6 +196,11 @@ def parse_place_command(message: str) -> bool:
 def parse_move_command(message: str) -> bool:
     """Parses a message for the !move command (case-insensitive, exact, trimmed)."""
     return message.strip().lower() == "!move"
+
+
+def parse_export_command(message: str) -> bool:
+    """Parses a message for the !export command (case-insensitive, exact, trimmed)."""
+    return message.strip().lower() == "!export"
 
 
 class Heartbeat:
@@ -1779,6 +1785,7 @@ def run_offline_build(
     interior_request: str | None = None,
     interior_reply: str | None = None,
     player: str | None = None,
+    schem_file: str | None = None,
 ) -> None:
     """Executes design, rendering, voxelization, and previews without RCON, printing results and timings.
     best: two designs at the same time and the AI keeps the better one."""
@@ -1872,6 +1879,10 @@ def run_offline_build(
             provider=provider,
         )
         grid, palette, dboxes = design
+
+    if schem_file:
+        schem.write_schem(schem_file, grid, palette, dboxes)
+        print(f"Schematic: {schem_file}")
 
     t_total = time.time() - t_total_start
     total_blocks = int(np.count_nonzero(grid)) + detail_block_count(dboxes)
@@ -2661,6 +2672,26 @@ def handle_chat_line(
             send_message(rcon, player, line)
         return
 
+    if parse_export_command(message):
+        if not is_op(player, config.OPS_FILE):
+            send_message(rcon, player, "Only ops can use !export.")
+            return
+        design = LAST_DESIGNS.get(player.strip().lower())
+        if design is None:
+            send_message(rcon, player, "No design to export. Use !design first.")
+            return
+        try:
+            safe_player = re.sub(r"[^A-Za-z0-9_-]+", "_", player.strip()) or "player"
+            filename = f"{safe_player}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.schem"
+            destination = config.WORK_DIR / "schematics" / filename
+            count = schem.write_schem(destination, *design)
+            x, y, z = design[0].shape
+            send_message(rcon, player, f"Exported {filename} ({x}x{z}x{y}, {count:,} blocks).")
+        except Exception:
+            logger.exception("Schematic export failed for player %s", player)
+            send_message(rcon, player, "Couldn't export that design.")
+        return
+
     is_anim_cmd, anim_arg = parse_anim_command(message)
     if is_anim_cmd:
         if not is_op(player, config.OPS_FILE):
@@ -3090,6 +3121,7 @@ def main() -> None:
     )
     parser.add_argument("--interior", type=str, default=None, help="With --scad/--blocks: furnish the inside with an optional review pass")
     parser.add_argument("--interior-reply", type=str, default=None, help="With --scad/--blocks: replay a saved interior reply (no AI call)")
+    parser.add_argument("--schem", type=str, default=None, help="With --scad/--blocks: write a Sponge schematic")
     parser.add_argument("--pixelart", type=str, default=None, help="Image URL or file path for pixel art")
     parser.add_argument("--width", type=int, default=None, help="Width for pixel art")
     parser.add_argument("--statue", type=str, default=None, help="Image URL, file path, or mesh name for 3D statue")
@@ -3164,6 +3196,7 @@ def main() -> None:
                 interior_request=args.interior,
                 interior_reply=args.interior_reply,
                 player=args.player,
+                schem_file=args.schem,
             )
         return
 
