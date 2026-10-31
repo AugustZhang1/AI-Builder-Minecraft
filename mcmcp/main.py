@@ -1442,8 +1442,7 @@ def run_fix(rcon: Rcon, player: str, changes: str) -> None:
 
 
 def run_interior(rcon: Rcon, player: str, request: str) -> None:
-    """Asks Claude to furnish the inside of the player's last design, then shows the new
-    version as a preview where the old preview was (or where they stand)."""
+    """Furnishes the inside of the player's last design and shows a preview."""
     STOP.clear()
     try:
         key = player.strip().lower()
@@ -1454,8 +1453,10 @@ def run_interior(rcon: Rcon, player: str, request: str) -> None:
         src = LAST_SOURCES.get(key)  # statues have none
         description = src.description if src else ""
         request = request or "Furnish it to suit the build."
+        provider = get_provider()
+        provider_name = PROVIDER_NAMES.get(provider, provider.capitalize())
         send_fn = lambda msg: send_message(rcon, player, msg)
-        send_message(rcon, player, "Redoing the inside with Claude...")  # whatever !designai says
+        send_message(rcon, player, f"Redoing the inside with {provider_name}...")
         inside = interior.analyze(*design)
         if isinstance(inside, str):
             send_message(rcon, player, inside)
@@ -1471,42 +1472,102 @@ def run_interior(rcon: Rcon, player: str, request: str) -> None:
         (out_dir / "interior-maps.txt").write_text(maps, encoding="utf-8")
         preview_png = preview.blocks_png(*build.stamp_details(*design))
 
-        heartbeat = Heartbeat(send_fn, "Claude", config.HEARTBEAT_SECONDS)
-        narrator = Narrator(send_fn, on_first=heartbeat.stop)
-        heartbeat.start()
-        try:
-            edits, raw = llm.interior(
-                description, request, maps, preview_png, on_text=narrator.feed, stop=STOP, work_dir=out_dir
-            )
-        finally:
-            heartbeat.stop()
-        narrator.flush()
-        (out_dir / "response.txt").write_text(raw, encoding="utf-8")
+        if STOP.is_set():
+            send_message(rcon, player, "Stopped.")
+            return
 
-        new = interior.apply(*design, inside, edits)
-        if new is None:
+        def ask(review_context=None):
+            heartbeat = Heartbeat(send_fn, provider_name, config.HEARTBEAT_SECONDS)
+            narrator = Narrator(send_fn, on_first=heartbeat.stop)
+            heartbeat.start()
+            try:
+                result = llm.interior(
+                    description,
+                    request,
+                    maps,
+                    preview_png,
+                    on_text=narrator.feed,
+                    stop=STOP,
+                    work_dir=out_dir,
+                    provider=provider,
+                    review=review_context,
+                )
+            finally:
+                heartbeat.stop()
+            narrator.flush()
+            return result
+
+        edits, raw = ask()
+        (out_dir / "candidate-response.txt").write_text(raw, encoding="utf-8")
+        (out_dir / "response.txt").write_text(raw, encoding="utf-8")
+        if STOP.is_set():
+            send_message(rcon, player, "Stopped.")
+            return
+        candidate = interior.apply(*design, inside, edits)
+        if candidate is None:
             send_message(rcon, player, "The AI left the inside as it is.")
             return
-        floating, far = interior.checks(*new, inside, edits)
-        logger.info("Interior checks for %s: %d floating blocks, %d edit cells far outside", player, floating, far)
+
+        floating, far = interior.checks(*candidate, inside, edits)
+        dark = interior.dark_spots(*candidate, inside)
+        warning = f"{floating} floating blocks; {far} edit cells far outside the shell; {dark} dark spots"
+        logger.info("Interior checks for %s: %s", player, warning)
 
         # Previews never fail a build.
-        for name, make in (
-            ("preview.png", lambda: preview.blocks_png(*build.stamp_details(*new))),
-            ("cutaway.png", lambda: interior.cutaways_png(*new, inside.free)),
-        ):
+        candidate_cutaway = None
+        try:
+            candidate_preview = preview.blocks_png(*build.stamp_details(*candidate))
+            (out_dir / "candidate-preview.png").write_bytes(candidate_preview)
+        except Exception as e:
+            logger.warning("Failed to write interior candidate preview: %s", e)
+        try:
+            candidate_cutaway = interior.cutaways_png(*candidate, inside.free)
+            (out_dir / "candidate-cutaway.png").write_bytes(candidate_cutaway)
+        except Exception as e:
+            logger.warning("Failed to write interior candidate cutaway: %s", e)
+
+        chosen, chosen_raw = candidate, raw
+        review_raw = ""
+        if get_review() and candidate_cutaway is not None and not STOP.is_set():
             try:
-                (out_dir / name).write_bytes(make())
+                review_edits, review_raw = ask((raw, candidate_cutaway, warning))
+                (out_dir / "review-response.txt").write_text(review_raw, encoding="utf-8")
+                if review_edits:
+                    reviewed = interior.apply(*design, inside, review_edits)
+                    if reviewed is not None:
+                        try:
+                            review_cutaway = interior.cutaways_png(*reviewed, inside.free)
+                            (out_dir / "review-cutaway.png").write_bytes(review_cutaway)
+                            chosen = reviewed
+                            chosen_raw = review_raw
+                        except Exception as e:
+                            logger.warning("Failed to write interior review cutaway; keeping candidate: %s", e)
+            except llm.LlmStopped:
+                raise
             except Exception as e:
-                logger.warning("Failed to write %s: %s", name, e)
-        LAST_DESIGNS[key] = new  # LAST_SOURCES stays: !designfix reads the design's own response.txt
+                logger.warning("Interior review failed; keeping candidate: %s", e)
+                try:
+                    (out_dir / "review-response.txt").write_text(review_raw, encoding="utf-8")
+                except OSError:
+                    pass
 
         if STOP.is_set():
-            send_message(rcon, player, "Stopped. Type !place to build it.")
+            send_message(rcon, player, "Stopped.")
             return
+        try:
+            (out_dir / "response.txt").write_text(chosen_raw, encoding="utf-8")
+            (out_dir / "preview.png").write_bytes(preview.blocks_png(*build.stamp_details(*chosen)))
+            (out_dir / "cutaway.png").write_bytes(interior.cutaways_png(*chosen, inside.free))
+        except Exception as e:
+            logger.warning("Failed to write chosen interior previews: %s", e)
+        if STOP.is_set():
+            send_message(rcon, player, "Stopped.")
+            return
+        LAST_DESIGNS[key] = chosen  # LAST_SOURCES stays: !designfix reads the design's own response.txt
+
         p = PREVIEWS.get(key)
         origin, facing, dim = (p.origin, p.facing, p.dim) if p is not None else player_spot(rcon, player)
-        show_preview(rcon, player, new, origin, facing, dim)
+        show_preview(rcon, player, chosen, origin, facing, dim)
         send_message(rcon, player, "Note: !designfix starts again from the design and drops this inside.")
 
     except llm.LlmStopped:
@@ -1779,8 +1840,18 @@ def run_offline_build(
                 reviewed = True
                 scad, blocks, mix, details, grid, palette, dboxes, skipped = rev
 
+    design = (grid, palette, dboxes)
     if interior_request is not None or interior_reply:
-        offline_interior(description, interior_request or "", (grid, palette, dboxes), build_dir, interior_reply, player)
+        design = offline_interior(
+            description,
+            interior_request or "",
+            design,
+            build_dir,
+            interior_reply,
+            player,
+            provider=provider,
+        )
+        grid, palette, dboxes = design
 
     t_total = time.time() - t_total_start
     total_blocks = int(np.count_nonzero(grid)) + detail_block_count(dboxes)
@@ -1814,36 +1885,82 @@ def offline_interior(
     build_dir: Path,
     reply_file: str | None = None,
     player: str | None = None,
-) -> None:
-    """The !interior steps without chat: one AI call (or a saved reply), files in build_dir,
-    the checks printed, and with a player the result placed on the local server."""
+    provider: str = "gemini",
+) -> tuple[np.ndarray, list[str], list[tuple[int, int, int, int, int, int, str]]]:
+    """Runs offline interior generation or replay, with one optional review pass."""
     inside = interior.analyze(*design)
     if isinstance(inside, str):
         print(inside)
-        return
+        return design
     maps = interior.maps_text(inside)
     (build_dir / "interior-maps.txt").write_text(maps, encoding="utf-8")
     if reply_file:
-        edits = llm.parse_interior(Path(reply_file).read_text(encoding="utf-8"))
+        raw = Path(reply_file).read_text(encoding="utf-8")
+        edits = llm.parse_interior(raw)
     else:
         preview_png = preview.blocks_png(*build.stamp_details(*design))
         edits, raw = llm.interior(
-            description, request or "Furnish it to suit the build.", maps, preview_png, work_dir=build_dir
+            description,
+            request or "Furnish it to suit the build.",
+            maps,
+            preview_png,
+            work_dir=build_dir,
+            provider=provider,
         )
-        (build_dir / "interior-response.txt").write_text(raw, encoding="utf-8")
-    new = interior.apply(*design, inside, edits)
-    if new is None:
+    (build_dir / "interior-response-candidate.txt").write_text(raw, encoding="utf-8")
+    candidate = interior.apply(*design, inside, edits)
+    if candidate is None:
         print("The AI left the inside as it is.")
-        return
-    floating, far = interior.checks(*new, inside, edits)
-    (build_dir / "interior-preview.png").write_bytes(preview.blocks_png(*build.stamp_details(*new)))
-    (build_dir / "cutaway.png").write_bytes(interior.cutaways_png(*new, inside.free))
-    print(f"Interior: {floating} floating blocks, {far} edit cells far outside the shell")
+        return design
+    floating, far = interior.checks(*candidate, inside, edits)
+    dark = interior.dark_spots(*candidate, inside)
+    warning = f"{floating} floating blocks; {far} edit cells far outside the shell; {dark} dark spots"
+    chosen, chosen_raw = candidate, raw
+    candidate_cutaway = interior.cutaways_png(*candidate, inside.free)
+    (build_dir / "interior-candidate-preview.png").write_bytes(preview.blocks_png(*build.stamp_details(*candidate)))
+    (build_dir / "interior-candidate-cutaway.png").write_bytes(candidate_cutaway)
+
+    if not reply_file and get_review():
+        review_raw = ""
+        try:
+            review_edits, review_raw = llm.interior(
+                description,
+                request or "Furnish it to suit the build.",
+                maps,
+                preview_png,
+                work_dir=build_dir,
+                provider=provider,
+                review=(raw, candidate_cutaway, warning),
+            )
+            (build_dir / "interior-review-response.txt").write_text(review_raw, encoding="utf-8")
+            if review_edits:
+                reviewed = interior.apply(*design, inside, review_edits)
+                if reviewed is not None:
+                    try:
+                        review_cutaway = interior.cutaways_png(*reviewed, inside.free)
+                        (build_dir / "interior-review-cutaway.png").write_bytes(review_cutaway)
+                        chosen, chosen_raw = reviewed, review_raw
+                    except Exception as e:
+                        logger.warning("Failed to write offline interior review cutaway; keeping candidate: %s", e)
+        except llm.LlmStopped:
+            raise
+        except Exception as e:
+            logger.warning("Offline interior review failed; keeping candidate: %s", e)
+            try:
+                (build_dir / "interior-review-response.txt").write_text(review_raw, encoding="utf-8")
+            except OSError:
+                pass
+
+    (build_dir / "interior-response.txt").write_text(chosen_raw, encoding="utf-8")
+    (build_dir / "interior-preview.png").write_bytes(preview.blocks_png(*build.stamp_details(*chosen)))
+    (build_dir / "cutaway.png").write_bytes(interior.cutaways_png(*chosen, inside.free))
+    print(f"Interior: {warning}")
     print("Interior files: interior-maps.txt, interior-preview.png, cutaway.png")
     if player:
         rcon = Rcon(*config.rcon_settings())
         origin, facing, dim = player_spot(rcon, player)
-        place_design(rcon, player, new, origin, facing, dim, time.time())
+        place_design(rcon, player, chosen, origin, facing, dim, time.time())
+    return chosen
 
 
 def tail_log(log_path: Path) -> Iterator[str]:
@@ -2876,7 +2993,7 @@ def main() -> None:
         action="store_true",
         help="Make two designs and keep the better one (about twice the AI usage); default: the !designbest setting with --player, off otherwise",
     )
-    parser.add_argument("--interior", type=str, default=None, help="With --scad/--blocks: furnish the inside with one AI call")
+    parser.add_argument("--interior", type=str, default=None, help="With --scad/--blocks: furnish the inside with an optional review pass")
     parser.add_argument("--interior-reply", type=str, default=None, help="With --scad/--blocks: replay a saved interior reply (no AI call)")
     parser.add_argument("--pixelart", type=str, default=None, help="Image URL or file path for pixel art")
     parser.add_argument("--width", type=int, default=None, help="Width for pixel art")

@@ -16,6 +16,59 @@ except ImportError:
 Box = tuple[int, int, int, int, int, int, str]
 FULL = np.ones((3, 3, 3), dtype=bool)
 LETTERS = "abcdefghijklmnpqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"  # no "o": it marks an opening
+SIX = ndimage.generate_binary_structure(3, 1)
+
+_LIGHT_BLOCKS = frozenset(
+    {
+        "minecraft:lantern",
+        "minecraft:soul_lantern",
+        "minecraft:glowstone",
+        "minecraft:shroomlight",
+        "minecraft:sea_lantern",
+        "minecraft:ochre_froglight",
+        "minecraft:pearlescent_froglight",
+        "minecraft:verdant_froglight",
+        "minecraft:torch",
+        "minecraft:wall_torch",
+        "minecraft:soul_torch",
+        "minecraft:soul_wall_torch",
+        "minecraft:redstone_torch",
+        "minecraft:redstone_wall_torch",
+        "minecraft:end_rod",
+        "minecraft:campfire",
+        "minecraft:soul_campfire",
+        "minecraft:furnace",
+        "minecraft:smoker",
+        "minecraft:blast_furnace",
+        "minecraft:redstone_lamp",
+        "minecraft:copper_bulb",
+    }
+)
+
+
+def _block_is_light(block: str) -> bool:
+    """Whether a stamped block is a light source for the advisory dark-spot check."""
+    base, _, state_text = block.partition("[")
+    if base.endswith("_candle") or base == "minecraft:candle":
+        return "lit=true" in state_text
+    if base not in _LIGHT_BLOCKS:
+        return False
+    if base in {
+        "minecraft:furnace",
+        "minecraft:smoker",
+        "minecraft:blast_furnace",
+        "minecraft:redstone_lamp",
+        "minecraft:copper_bulb",
+    }:
+        return "lit=true" in state_text
+    if base in {"minecraft:campfire", "minecraft:soul_campfire"}:
+        return "lit=false" not in state_text
+    if base in {
+        "minecraft:redstone_torch",
+        "minecraft:redstone_wall_torch",
+    }:
+        return "lit=false" not in state_text
+    return True
 
 
 class Inside(NamedTuple):
@@ -192,3 +245,45 @@ def checks(
         vol = (x2 - x1 + 1) * (y2 - y1 + 1) * (z2 - z1 + 1)
         far += vol - int(allowed[x1 + 2 : x2 + 3, y1 + 2 : y2 + 3, z1 + 2 : z2 + 3].sum())
     return floating, far
+
+
+def dark_spots(
+    grid: np.ndarray,
+    palette: list[str],
+    dboxes: list[Box],
+    inside: Inside,
+) -> int:
+    """Counts usable floor cells more than seven steps from an interior light.
+
+    This is an advisory check: light travels through air only, so solid walls block
+    it, and it uses the block's simple emitting state rather than full game lighting.
+    """
+    free = getattr(inside, "free", None)
+    if free is None or not np.any(free):
+        return 0
+
+    stamped, stamped_palette = build.stamp_details(grid, palette, dboxes, preserve_states=True)
+    air = np.zeros_like(stamped, dtype=bool)
+    lights = np.zeros_like(stamped, dtype=bool)
+    for value, block in enumerate(stamped_palette):
+        base = block.split("[", 1)[0]
+        if base == "minecraft:air":
+            air |= stamped == value
+        elif _block_is_light(block):
+            lights |= stamped == value
+
+    # A dark spot is an air cell with a solid support block immediately below it.
+    supported = np.zeros_like(air)
+    supported[:, :, 1:] = stamped[:, :, :-1] != 0
+    targets = free & air & supported
+
+    # Light blocks may be solid; after leaving a source, propagation is restricted to
+    # free air cells, which makes walls and furniture stop the advisory ray walk.
+    shell = getattr(inside, "skin", np.zeros_like(free, dtype=bool))
+    source = lights & (free | shell)
+    reachable = source.copy()
+    walkable = free & air
+    for _ in range(7):
+        reachable |= ndimage.binary_dilation(reachable, structure=SIX) & walkable
+
+    return int(np.count_nonzero(targets & ~reachable))

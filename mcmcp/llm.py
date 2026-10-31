@@ -197,15 +197,39 @@ Map symbols: a letter is a locked block of the outer shell (see the legend), . i
 (a door or window opening), _ is inside space that will be empty: whatever was there is removed, so it is all yours.
 The top row of a map is north (+Y, away from the player); the bottom row is the front (y = 0, where the player stands).
 The ground floor (z = 0) is kept; replace it with edits if the rooms need another floor.
-Build floors, ceilings, internal walls, stairs between floors with holes cut for them, doors, furniture and lights. Connect the rooms to the o openings. Nothing floats. Leave the shell as it is,
-except to fix it: you may add a missing door, a window or a stairwell (edits may replace shell blocks;
-minecraft:air cuts an opening).
+
+Plan the rooms first, in the same reply and before the JSON block. Write one short line per area with its floor and
+coordinates, usable size, purpose, focal piece, and access route. Choose rooms in this order: the player's request,
+the build's purpose, the available geometry, then these examples. Reserve the entrance, a connecting path, and stairs
+or ladders before furniture. Scale the room list to the space: a small castle may only need a hall and storage, and a
+small ship may combine crew sleeping and eating on one deck. If the description is missing or vague, infer conservatively
+from the outside picture.
+Examples are suggestions, not a fixed checklist: a castle may have a great hall with throne, kitchen, armory, chapel,
+guard rooms, bedchambers, or cellar; a pirate ship a captain's cabin with map table, crew bunks, galley, cargo hold,
+or gun deck; a tavern a bar with tables and guest rooms; a wizard tower library, brewing, enchanting, and a bedroom by
+floor; a shop or bakery a counter front with oven or workshop behind and a home above; a church pews, aisle, and altar;
+a lighthouse winding stairs, storage landings, and lamp room; a house living and kitchen, bedrooms, and bathroom.
+Public below and private above is a house default, not a rule.
+
+Reuse the exterior palette. Add characteristic clutter such as castle banners and stone hearths, ship timber bunks,
+barrels and cargo, or cottage warm wood, rugs and cupboards. Do not put modern items such as a fridge or TV in a
+historical build unless requested. Every purposeful room gets a focal piece and furniture that fits its size; keep paths
+clear and do not leave walls bare. There is no fixed piece count.
+Use these short, verified recipes and exact states: stair chairs or sofas with trapdoor arms; *_slab[type=top] tables on
+fences or stairs; barrel and trapdoor cupboards; water_cauldron[level=3] sinks; furnace or smoker stoves; campfire
+hearths; chain[axis=y] with lantern[hanging=true] chandeliers; fence plus lantern lamps; bookshelf walls; and a bed
+with a nightstand. A door is ONE lower entry (the code adds the upper half); a bed is two entries, part=foot and
+part=head. Place supports before dependent blocks. Use no entities. Light every floor area with lanterns, glowstone,
+shroomlight, or campfires; do not use bare torches as the main light.
+
+Build floors, ceilings, internal walls, stairs between floors with holes cut for them, doors, furniture and lights.
+Connect the rooms to the o openings. Nothing floats. Leave the shell as it is, except to fix it: you may add a missing
+door, a window or a stairwell (edits may replace shell blocks; minecraft:air cuts an opening).
 Write block states as if the player faces north: north = +Y, south = -Y (the front), east = +X, west = -X.
-A door is one entry at its lower block (the upper half is added for you). A bed is two entries: part=foot, and
-part=head on the cell the bed faces. Use only real Minecraft block ids and states. No fluids, fire, TNT, sand,
-gravel, concrete powder, command blocks, spawners, portals or bedrock.
+Use only real Minecraft block ids and states. No fluids, fire, TNT, sand, gravel, concrete powder, command blocks,
+spawners, portals or bedrock.
 Edits are placed in order and a later edit replaces an earlier one (e.g. a floor, then minecraft:air for a stair hole).
-Order the edits: floors, walls and stairs first, then furniture, then torches, lanterns and carpets.
+Order the edits: floors, walls and stairs first, then furniture, then lanterns and carpets.
 While working, write a few short progress lines starting with "// > " (they are shown to the player).
 Reply with ONE ```json block: {"edits": [[x1,y1,z1,x2,y2,z2,"minecraft:block[state]"], [x,y,z,"minecraft:block"], ...]}
 in grid coordinates (boxes are inclusive).
@@ -899,6 +923,56 @@ def pick(
         raise LlmError(f"Pick failed: {exc}") from exc
 
 
+def _interior_review_text(review: tuple[str, bytes, str] | None) -> str:
+    if review is None:
+        return ""
+    raw, _cutaway, warnings = review
+    return (
+        "\n\nThis is one review pass over the candidate above. Read the original maps and design, the candidate's "
+        "room plan and edits, the cutaway, and the advisory warnings. Return a COMPLETE corrected edits list for "
+        "the ORIGINAL design and maps, not a patch on top of the candidate. Preserve good work, fix every warning "
+        "you can, and keep paths and access usable. Your room plan lines must still come before the JSON block.\n"
+        f"First reply (including its room plan):\n{raw}\n\nAdvisory warnings:\n{warnings or 'none'}"
+    )
+
+
+def _interior_gemini_prompt(
+    description: str,
+    request: str,
+    work: Path,
+    review: tuple[str, bytes, str] | None,
+) -> str:
+    work = work.resolve()
+    prompt_file = work / "interior.md"
+    prompt_file.write_text(INTERIOR_TEXT, encoding="utf-8")
+    (work / "interior-description.txt").write_text(description.strip(), encoding="utf-8")
+    (work / "interior-player-request.txt").write_text(request.strip(), encoding="utf-8")
+    if review is not None:
+        raw, cutaway, warnings = review
+        (work / "interior-first-reply.txt").write_text(raw, encoding="utf-8")
+        (work / "interior-cutaway.png").write_bytes(cutaway)
+        (work / "interior-warnings.txt").write_text(warnings, encoding="utf-8")
+        task = (
+            f"This is the one review pass. Read the first reply at {work / 'interior-first-reply.txt'}, the cutaway "
+            f"at {work / 'interior-cutaway.png'}, and the advisory warnings at {work / 'interior-warnings.txt'}. "
+            "Read the original map and design too. "
+            "Return a COMPLETE corrected edits list for the ORIGINAL design and maps, not a patch on top of the "
+            "candidate; preserve good work, fix warnings, and keep paths usable."
+        )
+    else:
+        task = "Plan the rooms in your reply, then return the furnishing edits for the original maps."
+    return (
+        f"Read {prompt_file} first and follow it exactly.\n"
+        f"Read the build description from {work / 'interior-description.txt'}, the player's request from "
+        f"{work / 'interior-player-request.txt'}, and the maps from {work / 'interior-maps.txt'}.\n"
+        f"The outside preview is {work / 'interior-preview.png'}; inspect it before editing.\n"
+        "Interior task restrictions: do not use any tools except to read the named files. Do not run commands or "
+        "create, edit, or delete files. Reply with room-plan lines followed by ONE JSON fence containing the edits "
+        "list.\n"
+        f"{task}"
+    )
+
+
 def interior(
     description: str,
     request: str,
@@ -908,39 +982,55 @@ def interior(
     stop: threading.Event | None = None,
     work_dir: Path | None = None,
     timeout: float = config.CLAUDE_TIMEOUT,
+    provider: str = "claude",
+    review: tuple[str, bytes, str] | None = None,
 ) -> tuple[list[tuple[int, int, int, int, int, int, str]], str]:
-    """Asks Claude CLI to furnish the inside of a build from text maps of its layers.
+    """Asks a configured CLI to furnish or review the inside of a build.
 
-    Returns (edits, raw reply). Raises LlmError if the reply has no valid ```json
-    block with an "edits" list.
+    Returns (edits, raw reply). A review receives the original candidate reply,
+    cutaway and advisory warnings, and must return a complete replacement list.
     """
-    work = work_dir or _CLI_WORKDIR
+    if provider not in config.PROVIDERS:
+        raise LlmError(f"Unknown provider: {provider!r}. Must be one of {config.PROVIDERS}")
+    work = (work_dir or _CLI_WORKDIR).resolve()
     work.mkdir(parents=True, exist_ok=True)
-
-    prompt_file = work / "interior.md"
-    prompt_file.write_text(INTERIOR_TEXT, encoding="utf-8")
-    cmd = _cli_command(prompt_file)
+    (work / "interior-maps.txt").write_text(maps_text, encoding="utf-8")
+    (work / "interior-preview.png").write_bytes(preview_png)
 
     text = (
         f"Description of the build:\n{description.strip()}\n\n"
         f"The player's request:\n{request.strip()}\n\n"
         f"{maps_text}"
+        f"{_interior_review_text(review)}"
     )
-    content: list[dict[str, Any]] = [
-        {"type": "text", "text": "The outside of the build:"},
-        _image_part(preview_png),
-        {"type": "text", "text": text},
-    ]
-    msg = {"type": "user", "message": {"role": "user", "content": content}}
-    stdin_payload = json.dumps(msg) + "\n"
+    if provider == "claude":
+        prompt_file = work / "interior.md"
+        prompt_file.write_text(INTERIOR_TEXT, encoding="utf-8")
+        cmd = _cli_command(prompt_file)
+        content: list[dict[str, Any]] = [
+            {"type": "text", "text": "The outside of the build:"},
+            _image_part(preview_png),
+            {"type": "text", "text": text},
+        ]
+        if review is not None:
+            content.append({"type": "text", "text": "Candidate cutaway:"})
+            content.append(_image_part(review[1]))
+        msg = {"type": "user", "message": {"role": "user", "content": content}}
+        stdin_payload: str | None = json.dumps(msg) + "\n"
+    else:
+        prompt_text = _interior_gemini_prompt(description, request, work, review)
+        cmd = _agy_command(prompt_text)
+        stdin_payload = None
 
     try:
         chunks: list[str] = []
-        for chunk in _run_cli(cmd, stdin_payload, work, timeout, provider="claude", stop=stop):
+        for chunk in _run_cli(cmd, stdin_payload, work, timeout, provider=provider, stop=stop):
             chunks.append(chunk)
             if on_text:
                 on_text(chunk)
         reply = "".join(chunks)
+        reply_file = work / ("interior-review-reply.txt" if review is not None else "interior-generation-reply.txt")
+        reply_file.write_text(reply, encoding="utf-8")
         return parse_interior(reply), reply
     except LlmError:
         raise

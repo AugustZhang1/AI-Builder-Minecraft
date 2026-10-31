@@ -842,10 +842,14 @@ def stamp_details(
     grid: np.ndarray,
     palette: list[str],
     dboxes: list[tuple[int, int, int, int, int, int, str]],
+    *,
+    preserve_states: bool = False,
 ) -> tuple[np.ndarray, list[str]]:
-    """Stamp detail boxes into a copy of grid, clipped to grid bounds. For previews only.
-    Slabs and stairs keep their states in the palette so the preview can draw their shape;
-    every other block goes in by its base id."""
+    """Stamp detail boxes into a copy of grid, clipped to grid bounds.
+
+    Previews keep states only for slabs and stairs; schematic exports request all
+    states so the placed block is represented exactly.
+    """
     new_grid = grid.copy()
     new_palette = list(palette)
     palette_map = {b: i for i, b in enumerate(new_palette)}
@@ -867,7 +871,7 @@ def stamp_details(
         if base_id == "minecraft:air":  # cuts a hole
             new_grid[cx1 : cx2 + 1, cy1 : cy2 + 1, cz1 : cz2 + 1] = 0
             continue
-        entry = block if base_id.endswith(("_slab", "_stairs")) else base_id
+        entry = block if preserve_states or base_id.endswith(("_slab", "_stairs")) else base_id
         if entry not in palette_map:
             if len(new_palette) >= 256:
                 raise BuildError("Too many distinct block types (max 255)")
