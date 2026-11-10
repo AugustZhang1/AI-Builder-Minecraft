@@ -49,6 +49,9 @@ chat line in logs/latest.log  (ops only)
 | `!design <image link> <description>` | The same, using the picture as a reference |
 | `!designfix <changes>` | The AI changes your last design, e.g. `!designfix make the roof taller` |
 | `!interior [what you want]` | The AI furnishes the inside of your last design, e.g. `!interior a cozy two-room cottage` |
+| `!pos1`, `!pos2` | Mark the two corners of a box around any build, at the block you stand in |
+| `!edit <changes>` | The AI changes the build in that box and shows the changes as a preview (red glass = removed), e.g. `!edit add a chimney`; `!place` applies them |
+| `!editundo` | Takes back your last placed `!edit` |
 | `!move` | Moves the preview to where you stand, facing where you look |
 | `!place` | Builds the preview where it is (or your last design where you stand) |
 | `!pixelart <image link> [width]` | Builds the picture as a flat wall (no AI) |

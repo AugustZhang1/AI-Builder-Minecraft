@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+import re
 import threading
 
 from mcp.server.mcpserver import MCPServer
@@ -47,22 +48,27 @@ def _get_rcon() -> Rcon:
     return _rcon
 
 
-def _call(fn: Callable[..., None], *args) -> str:
-    """Runs one pipeline step under the build lock and returns its chat lines."""
+_PLAYER_RE = re.compile(r"[A-Za-z0-9_]{3,16}")  # as in chat: the name goes into commands and file names
+
+
+def _call(fn: Callable[..., None], player: str, *args) -> str:
+    """Runs one pipeline step for player under the build lock and returns its chat lines."""
+    if not _PLAYER_RE.fullmatch(player):
+        return "Invalid player name."
     if not _lock.acquire(blocking=False):
         return "A build is already running. Try again when it finishes, or call stop."
     _log.lines = []
     try:
-        fn(_get_rcon(), *args)
+        fn(_get_rcon(), player, *args)
         return "\n".join(_log.lines) or "Done."
     finally:
         _log.lines = None
         _lock.release()
 
 
-async def _run(fn: Callable[..., None], *args) -> str:
+async def _run(fn: Callable[..., None], player: str, *args) -> str:
     # In a thread, so the server keeps answering (e.g. stop) during a long build.
-    return await asyncio.to_thread(_call, fn, *args)
+    return await asyncio.to_thread(_call, fn, player, *args)
 
 
 @server.tool()

@@ -26,10 +26,10 @@ import numpy as np
 from PIL import Image
 
 try:
-    from . import animate, build, config, figure, ghost, interior, llm, pixelart, preview, saves, schem, statue, statue_grid
+    from . import animate, build, config, edit_ops, edit_prompt, edit_undo, figure, ghost, interior, llm, pixelart, preview, region, saves, schem, statue, statue_grid
     from .rcon import Rcon, RconError
 except ImportError:
-    from mcmcp import animate, build, config, figure, ghost, interior, llm, pixelart, preview, saves, schem, statue, statue_grid
+    from mcmcp import animate, build, config, edit_ops, edit_prompt, edit_undo, figure, ghost, interior, llm, pixelart, preview, region, saves, schem, statue, statue_grid
     from mcmcp.rcon import Rcon, RconError
 
 logger = logging.getLogger("mcmcp")
@@ -41,7 +41,9 @@ class PlacementError(Exception):
     pass
 
 
-CHAT_RE = re.compile(r"\]: (?:\[Not Secure\] )?<([A-Za-z0-9_]{3,16})> (.*)$")
+# Anchored to the line's own "[time] [thread/LEVEL]: " header: text a player controls (/me, item
+# and mob names in death messages) can hold "]: <SomeOp> !design ..." further along the line.
+CHAT_RE = re.compile(r"^(?:\[[^\]]*\] ?)+: (?:\[Not Secure\] )?<([A-Za-z0-9_]{3,16})> (.*)$")
 URL_RE = re.compile(r"https?://\S+")
 FRANK_RE = re.compile(r"\bfrank\b", re.IGNORECASE)
 NARRATION_RE = re.compile(r"^\s*//\s*>\s*(.+?)\s*$")
@@ -70,8 +72,23 @@ class Source(NamedTuple):
     dir: Path  # the design's folder, with its response.txt and preview.png
 
 
+class PendingEdit(NamedTuple):
+    """An !edit shown as a hologram, waiting for !place."""
+
+    dim: str
+    box: region.Box              # the selection in the world
+    grid: np.ndarray             # the blocks read at !edit
+    palette: list[str]
+    new_grid: np.ndarray         # the same with the AI's edits
+    new_palette: list[str]
+    changed: np.ndarray          # the cells that differ
+
+
 PREVIEWS: dict[str, Preview] = {}
 LAST_SOURCES: dict[str, Source] = {}
+EDIT_CORNERS: dict[str, dict[int, tuple[tuple[int, int, int], str]]] = {}  # player -> {1 or 2: (block, dim)}
+PENDING_EDITS: dict[str, PendingEdit] = {}
+EDIT_INFLATE = 0.01  # the hologram of a change is this much bigger than the block it covers
 
 HELP_LINES = (
     "Commands (ops only):",
@@ -79,6 +96,9 @@ HELP_LINES = (
     "!design <image link> <description> - the same, using the picture as a reference",
     "!designfix <changes> - the AI changes your last design, e.g. !designfix make the roof taller",
     "!interior [what you want] - the AI furnishes the inside of your last design, e.g. !interior a cozy two-room cottage",
+    "!pos1, !pos2 - mark the two corners of a box around any build, at the block you stand in",
+    "!edit <changes> - the AI changes the build in that box and shows the changes, e.g. !edit add a chimney",
+    "!editundo - takes back your last placed !edit",
     "!move - moves the preview to where you stand, facing where you look",
     "!place - builds the preview where it is (or your last design where you stand)",
     "!save <name> - saves your last design for later",
@@ -1258,6 +1278,7 @@ def clear_preview(rcon: Rcon, player: str) -> None:
     so if some are left the preview's chunks are force-loaded until they are gone (or
     config.GHOST_CLEAR_SECONDS pass)."""
     key = player.strip().lower()
+    PENDING_EDITS.pop(key, None)  # an !edit lives only as long as its hologram
     p = PREVIEWS.get(key)
     if p is None:
         return
@@ -1312,6 +1333,11 @@ def show_preview(
         "Type !place to build it there, !move to move it to where you stand, "
         "!designfix <changes> to change it, !interior to furnish the inside, or !designstop to remove it.",
     )
+
+
+def design_preview(key: str) -> Preview | None:
+    """The player's design preview. An !edit hologram is not one: its spot is the edited box."""
+    return None if key in PENDING_EDITS else PREVIEWS.get(key)
 
 
 def _misfit(grid: np.ndarray, origin: tuple[int, int, int], dim: str) -> str | None:
@@ -1456,7 +1482,7 @@ def run_fix(rcon: Rcon, player: str, changes: str) -> None:
         if STOP.is_set():
             send_message(rcon, player, "Stopped. Type !place to build it.")
             return
-        p = PREVIEWS.get(key)
+        p = design_preview(key)
         origin, facing, dim = (p.origin, p.facing, p.dim) if p is not None else player_spot(rcon, player)
         show_preview(rcon, player, design_tuple, origin, facing, dim)
 
@@ -1591,7 +1617,7 @@ def run_interior(rcon: Rcon, player: str, request: str) -> None:
             return
         LAST_DESIGNS[key] = chosen  # LAST_SOURCES stays: !designfix reads the design's own response.txt
 
-        p = PREVIEWS.get(key)
+        p = design_preview(key)
         origin, facing, dim = (p.origin, p.facing, p.dim) if p is not None else player_spot(rcon, player)
         show_preview(rcon, player, chosen, origin, facing, dim)
         send_message(rcon, player, "Note: !designfix starts again from the design and drops this inside.")
@@ -1601,6 +1627,223 @@ def run_interior(rcon: Rcon, player: str, request: str) -> None:
     except Exception as e:
         logger.exception("Interior failed for player %s: %s", player, e)
         send_message(rcon, player, f"Interior failed: {_reason(e)}")
+
+
+def edit_box(key: str) -> tuple[region.Box, str] | str:
+    """The player's selection as (box, dim), or the message saying why there is none."""
+    corners = EDIT_CORNERS.get(key, {})
+    if 1 not in corners or 2 not in corners:
+        return "Mark both corners first: stand in one and type !pos1, then !pos2 in the opposite one."
+    (a, dim_a), (b, dim_b) = corners[1], corners[2]
+    if dim_a != dim_b:
+        return "The two corners are in different dimensions."
+    box = (*(min(p, q) for p, q in zip(a, b)), *(max(p, q) for p, q in zip(a, b)))
+    X, Y, Z = box[3] - box[0] + 1, box[5] - box[2] + 1, box[4] - box[1] + 1
+    if X * Y * Z > config.EDIT_MAX_CELLS:
+        return f"The box ({X}x{Y}x{Z}) is too big: at most {config.EDIT_MAX_CELLS:,} blocks."
+    return box, dim_a
+
+
+def edit_origin(box: region.Box) -> tuple[int, int, int]:
+    """The origin that puts a design facing north exactly on the box, so the placing and hologram
+    code for designs works on a selection: world = (x1 + x, y1 + z, z2 - y)."""
+    return (box[0] + (box[3] - box[0] + 1) // 2, box[1], box[5] + config.GAP)
+
+
+def run_pos(rcon: Rcon, player: str, corner: int) -> None:
+    """!pos1 / !pos2: remembers the block the player stands in as a corner of their selection."""
+    try:
+        pos, _, dim = player_spot(rcon, player)
+    except Exception as e:
+        logger.exception("Position failed for player %s: %s", player, e)
+        send_message(rcon, player, "Couldn't read your position.")
+        return
+    key = player.strip().lower()
+    EDIT_CORNERS.setdefault(key, {})[corner] = (pos, dim)
+    msg = f"Corner {corner} set to {pos[0]} {pos[1]} {pos[2]}."
+    found = edit_box(key)
+    if not isinstance(found, str):
+        box = found[0]
+        msg += f" Box: {box[3] - box[0] + 1}x{box[5] - box[2] + 1}x{box[4] - box[1] + 1}. Type !edit <changes>."
+    elif len(EDIT_CORNERS[key]) == 2:
+        msg += " " + found
+    send_message(rcon, player, msg)
+
+
+def read_selection(dim: str, box: region.Box) -> region.Snapshot:
+    """Saves the world and reads the box from its region files. The save has its own RCON
+    connection, because it can take longer than the shared one waits."""
+    saver = Rcon(*config.rcon_settings(), timeout=120.0)
+    try:
+        saver.command("save-all flush")
+    finally:
+        saver.close()
+    try:
+        return region.read_box(config.world_dir(), dim, box)
+    except region.RegionError:
+        time.sleep(1)  # the files may still be written
+        return region.read_box(config.world_dir(), dim, box)
+
+
+def run_edit(rcon: Rcon, player: str, changes: str) -> None:
+    """Has the AI change the build in the player's selection and shows the changes as a hologram."""
+    STOP.clear()
+    try:
+        key = player.strip().lower()
+        found = edit_box(key)
+        if isinstance(found, str):
+            send_message(rcon, player, found)
+            return
+        box, dim = found
+        provider = get_provider()
+        provider_name = PROVIDER_NAMES.get(provider, provider.capitalize())
+        send_fn = lambda msg: send_message(rcon, player, msg)
+        send_message(rcon, player, f"Reading the build, then changing it with {provider_name}...")
+        snap = read_selection(dim, box)
+        if not snap.grid.any():
+            send_message(rcon, player, "There are no blocks in the box.")
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        out_dir = config.WORK_DIR / f"{timestamp}-{player}-edit"
+        edit_prompt.write_scan(out_dir, snap.grid, snap.palette, snap.locked)
+        (out_dir / "request.txt").write_text(
+            f"Player: {player}\nProvider: {provider}\nDimension: {dim}\nBox: {box}\nChanges: {changes}\n",
+            encoding="utf-8",
+        )
+        if STOP.is_set():
+            send_message(rcon, player, "Stopped.")
+            return
+
+        def ask(review: str | None = None) -> str:
+            heartbeat = Heartbeat(send_fn, provider_name, config.HEARTBEAT_SECONDS)
+            narrator = Narrator(send_fn, on_first=heartbeat.stop)
+            heartbeat.start()
+            try:
+                raw = edit_prompt.ask(
+                    changes, out_dir, review=review, on_text=narrator.feed, stop=STOP, provider=provider
+                )
+            finally:
+                heartbeat.stop()
+            narrator.flush()
+            return raw
+
+        raw = ask()
+        result = edit_ops.apply_ops(snap.grid, snap.palette, edit_ops.parse_ops(raw, snap.grid.shape), snap.locked)
+
+        if get_review() and result[2].any() and not STOP.is_set():
+            try:
+                edit_prompt.write_result(out_dir, result[0], result[1])
+                review_raw = ask(raw)
+                if not llm.KEEP_RE.search(llm.FENCE_RE.sub("", review_raw)):
+                    result = edit_ops.apply_ops(
+                        snap.grid, snap.palette, edit_ops.parse_ops(review_raw, snap.grid.shape), snap.locked
+                    )
+            except llm.LlmStopped:
+                raise
+            except Exception as e:
+                logger.warning("Edit review failed; keeping the first result: %s", e)
+
+        new_grid, new_palette, changed = result
+        count = int(changed.sum())
+        if STOP.is_set():
+            send_message(rcon, player, "Stopped.")
+            return
+        if count == 0:
+            send_message(rcon, player, "The AI changed nothing.")
+            return
+
+        clear_preview(rcon, player)
+        ghost_grid, ghost_palette = edit_ops.ghost_design(new_grid, new_palette, changed)
+        origin = edit_origin(box)
+        _, boxes = ghost.ghost_boxes(ghost_grid, config.GHOST_MAX_ENTITIES)
+        pacer = Pacer()
+        shown = 0
+        for cmd in ghost.summon_commands(
+            boxes, ghost_palette, ghost_grid.shape[0], origin, "north", dim, player, inflate=EDIT_INFLATE
+        ):
+            if "Summoned" in rcon.command(cmd):
+                shown += 1
+            pacer.wait(1)
+        PREVIEWS[key] = Preview(origin, "north", dim, ghost_grid.shape, shown)
+        PENDING_EDITS[key] = PendingEdit(dim, box, snap.grid, snap.palette, new_grid, new_palette, changed)
+        send_message(
+            rcon,
+            player,
+            f"{count:,} blocks change (red glass = removed)"
+            + ("; part of it is too far away to show" if shown < len(boxes) else "")
+            + ". Type !place to apply it or !designstop to drop it.",
+        )
+
+    except llm.LlmStopped:
+        send_message(rcon, player, "Stopped.")
+    except (region.RegionError, edit_ops.EditError) as e:
+        logger.warning("Edit failed for player %s: %s", player, e)
+        send_message(rcon, player, f"Edit failed: {_reason(e)}")
+    except Exception as e:
+        logger.exception("Edit failed for player %s: %s", player, e)
+        send_message(rcon, player, f"Edit failed: {_reason(e)}")
+
+
+def place_changes(
+    rcon: Rcon, dim: str, box: region.Box, grid: np.ndarray, palette: list[str], changed: np.ndarray
+) -> int:
+    """Places the changed cells of grid into the selection, with its chunks force-loaded.
+    Returns the number of changed cells (callers check STOP for a run cut short)."""
+    origin = edit_origin(box)
+    dboxes = edit_ops.change_boxes(grid, palette, changed, config.FILL_MAX_VOLUME)
+    for cmd in forceload_commands(dim, "add", grid.shape, origin, "north"):
+        rcon.command(cmd)
+    try:
+        place_details(rcon, dboxes, grid.shape[0], origin, "north", dim)
+    finally:
+        for cmd in forceload_commands(dim, "remove", grid.shape, origin, "north"):
+            rcon.command(cmd)
+    return int(changed.sum())
+
+
+def run_edit_place(rcon: Rcon, player: str) -> None:
+    """!place on an !edit hologram: saves the undo, then places the changed blocks."""
+    STOP.clear()
+    try:
+        key = player.strip().lower()
+        edit = PENDING_EDITS.get(key)
+        if edit is None:
+            send_message(rcon, player, "No edit to place. Use !edit first.")
+            return
+        edit_undo.save(player, edit_undo.Undo(edit.dim, edit.box, edit.grid, edit.palette, edit.changed))
+        clear_preview(rcon, player)
+        count = place_changes(rcon, edit.dim, edit.box, edit.new_grid, edit.new_palette, edit.changed)
+        if STOP.is_set():
+            send_message(rcon, player, "Stopped. Type !editundo to take back what was placed.")
+        else:
+            send_message(rcon, player, f"Done: {count:,} blocks changed. Type !editundo to take it back.")
+    except Exception as e:
+        logger.exception("Edit place failed for player %s: %s", player, e)
+        send_message(rcon, player, f"Edit failed: {_reason(e)} Type !editundo to take back what was placed.")
+
+
+def run_edit_undo(rcon: Rcon, player: str) -> None:
+    """!editundo: puts the original blocks back on the cells the last placed !edit changed."""
+    STOP.clear()
+    try:
+        try:
+            undo = edit_undo.load(player)
+        except FileNotFoundError:
+            send_message(rcon, player, "Nothing to undo.")
+            return
+        except ValueError:
+            send_message(rcon, player, "The undo could not be loaded.")
+            return
+        count = place_changes(rcon, undo.dim, undo.box, undo.grid, undo.palette, undo.changed)
+        if STOP.is_set():
+            send_message(rcon, player, "Stopped. Type !editundo again to finish it.")
+            return
+        edit_undo.clear(player)
+        send_message(rcon, player, f"Undone: {count:,} blocks put back.")
+    except Exception as e:
+        logger.exception("Edit undo failed for player %s: %s", player, e)
+        send_message(rcon, player, f"Undo failed: {_reason(e)}")
 
 
 def run_build(
@@ -1761,11 +2004,7 @@ def run_build(
         send_message(rcon, player, "Stopped.")
     except Exception as e:
         logger.exception("Build failed for player %s: %s", player, e)
-        err_str = str(e).strip()
-        reason = err_str.splitlines()[0] if err_str else type(e).__name__
-        if len(reason) > 100:
-            reason = reason[:97] + "..."
-        send_message(rcon, player, f"Build failed: {reason}")
+        send_message(rcon, player, f"Build failed: {_reason(e)}")
     finally:
         # Errors, refusals and !designstop all end here, so nothing is left behind.
         if survey is not None:
@@ -1890,7 +2129,7 @@ def run_offline_build(
     print(f"Block count: {total_blocks}")
     print(f"Detail boxes: {len(dboxes)}" + (" (skipped: design was scaled down)" if skipped else ""))
     print(f"Grid size: {grid.shape}")
-    print(f"Previews: preview.png, mesh.png, mesh.glb")
+    print("Previews: preview.png, mesh.png, mesh.glb")
     print(f"Folder: {build_dir}")
     if reviewed:
         print(f"Review folder: {build_dir / 'review'}")
@@ -2026,7 +2265,7 @@ def tail_log(log_path: Path) -> Iterator[str]:
                 cur_stat = log_path.stat()
                 same_file = os.path.samestat(cur_stat, os.fstat(f.fileno()))
             except OSError:
-                same_file = False
+                continue  # the log is being rotated; the next pass picks the new file up
 
             if not same_file:
                 f.close()
@@ -2185,16 +2424,7 @@ def run_pixelart(
     start_time = time.time()
     try:
         # a. Player Pos/Rotation/Dimension -> origin, facing, top
-        pos_reply = rcon.command(f"data get entity {player} Pos")
-        rot_reply = rcon.command(f"data get entity {player} Rotation")
-        dim_reply = rcon.command(f"data get entity {player} Dimension")
-
-        pos = parse_pos_reply(pos_reply)
-        rot = parse_rotation_reply(rot_reply)
-        dim = parse_dimension_reply(dim_reply)
-
-        origin = (math.floor(pos[0]), math.floor(pos[1]), math.floor(pos[2]))
-        facing = build.facing_from_yaw(rot[0])
+        origin, facing, dim = player_spot(rcon, player)
         top = 319 if dim in ("minecraft:overworld", "overworld") else 255
 
         # b. Image download & native_image
@@ -2317,11 +2547,7 @@ def run_pixelart(
 
     except Exception as e:
         logger.exception("Pixel art failed for player %s: %s", player, e)
-        err_str = str(e).strip()
-        reason = err_str.splitlines()[0] if err_str else type(e).__name__
-        if len(reason) > 100:
-            reason = reason[:97] + "..."
-        send_message(rcon, player, f"Pixel art failed: {reason}", prefix="[pixelart]")
+        send_message(rcon, player, f"Pixel art failed: {_reason(e)}", prefix="[pixelart]")
 
 
 def run_offline_pixelart(source: str, width: int | None = None) -> None:
@@ -2907,6 +3133,58 @@ def handle_chat_line(
         threading.Thread(target=interior_worker, daemon=True).start()
         return
 
+    pos_cmd = message.strip().lower()
+    if pos_cmd in ("!pos1", "!pos2"):
+        if not is_op(player, config.OPS_FILE):
+            send_message(rcon, player, f"Only ops can use {pos_cmd}.")
+            return
+        run_pos(rcon, player, int(pos_cmd[-1]))
+        return
+
+    is_edit_cmd, edit_arg = _parse_word_command(message, "!edit")
+    if is_edit_cmd:
+        if not is_op(player, config.OPS_FILE):
+            send_message(rcon, player, "Only ops can use !edit.")
+            return
+        if edit_arg is None:
+            send_message(rcon, player, "Usage: !edit <changes>, e.g. !edit add a chimney (after !pos1 and !pos2)")
+            return
+        found = edit_box(player.strip().lower())
+        if isinstance(found, str):
+            send_message(rcon, player, found)
+            return
+        if build_lock is not None and not build_lock.acquire(blocking=False):
+            send_message(rcon, player, "A build is already running. Try again when it finishes.")
+            return
+
+        def edit_worker():
+            try:
+                run_edit(rcon, player, edit_arg)
+            finally:
+                if build_lock is not None:
+                    build_lock.release()
+
+        threading.Thread(target=edit_worker, daemon=True).start()
+        return
+
+    if message.strip().lower() == "!editundo":
+        if not is_op(player, config.OPS_FILE):
+            send_message(rcon, player, "Only ops can use !editundo.")
+            return
+        if build_lock is not None and not build_lock.acquire(blocking=False):
+            send_message(rcon, player, "A build is already running. Try again when it finishes.")
+            return
+
+        def undo_worker():
+            try:
+                run_edit_undo(rcon, player)
+            finally:
+                if build_lock is not None:
+                    build_lock.release()
+
+        threading.Thread(target=undo_worker, daemon=True).start()
+        return
+
     is_fix_cmd, fix_arg = _parse_word_command(message, "!designfix")
     if is_fix_cmd:
         if not is_op(player, config.OPS_FILE):
@@ -3033,8 +3311,9 @@ def handle_chat_line(
             send_message(rcon, player, "Only ops can use !place.")
             return
 
+        is_edit = player.strip().lower() in PENDING_EDITS
         saved = LAST_DESIGNS.get(player.strip().lower())
-        if saved is None:
+        if saved is None and not is_edit:
             send_message(rcon, player, "No saved design. Use !design first.")
             return
 
@@ -3048,7 +3327,10 @@ def handle_chat_line(
 
         def place_worker():
             try:
-                run_place(rcon, player)
+                if is_edit:
+                    run_edit_place(rcon, player)
+                else:
+                    run_place(rcon, player)
             finally:
                 if build_lock is not None:
                     build_lock.release()

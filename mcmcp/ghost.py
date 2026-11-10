@@ -87,17 +87,24 @@ def summon_commands(
     facing: str,
     dim: str,
     player: str,
+    inflate: float = 0.0,
 ) -> list[str]:
-    """One block_display summon per box, scaled to the box and placed at its lowest world corner."""
+    """One block_display summon per box, scaled to the box and placed at its lowest world corner.
+    inflate: blocks added on every side, so a hologram over an existing block does not flicker."""
     tags = f'"{GHOST_TAG}","{player_tag(player)}"'
     cmds: list[str] = []
     for box in boxes:
         x1, y1, z1, x2, y2, z2 = build.box_to_world(box, size_x, origin, facing, config.GAP)
         block = palette[box[6]].split("[", 1)[0]
+        pos = f"{x1}.0 {y1}.0 {z1}.0"
+        scale = f"{x2 - x1 + 1}f,{y2 - y1 + 1}f,{z2 - z1 + 1}f"
+        if inflate:
+            pos = f"{x1 - inflate} {y1 - inflate} {z1 - inflate}"
+            scale = ",".join(f"{hi - lo + 1 + 2 * inflate}f" for lo, hi in ((x1, x2), (y1, y2), (z1, z2)))
         cmds.append(
-            f"execute in {dim} run summon minecraft:block_display {x1}.0 {y1}.0 {z1}.0 "
+            f"execute in {dim} run summon minecraft:block_display {pos} "
             f'{{Tags:[{tags}],block_state:{{Name:"{block}"}},brightness:{{sky:15,block:15}},view_range:4f,'
             f"transformation:{{left_rotation:[0f,0f,0f,1f],right_rotation:[0f,0f,0f,1f],translation:[0f,0f,0f],"
-            f"scale:[{x2 - x1 + 1}f,{y2 - y1 + 1}f,{z2 - z1 + 1}f]}}}}"
+            f"scale:[{scale}]}}}}"
         )
     return cmds

@@ -88,6 +88,7 @@ MIN_COMMAND_DELAY = 0.002          # seconds between placement commands
 # !interior (the AI redoes the inside of a design).
 INTERIOR_SKIN = 1                  # blocks of the outer shell that stay as they are
 INTERIOR_MAX_CELLS = 100_000       # largest map crop (cells) sent to the AI
+EDIT_MAX_CELLS = 100_000           # !edit: largest selection (cells), e.g. 50x50x40
 
 # !pixelart (no AI). Sizes come from the image and the free space; these are sanity caps.
 PIXELART_MAX_SIDE = 512            # px, longest side after sprite detection
@@ -120,6 +121,11 @@ def server_properties() -> dict[str, str]:
             k, v = line.split("=", 1)
             props[k.strip()] = v.strip()
     return props
+
+
+def world_dir() -> Path:
+    """The world folder (level-name in server.properties), whose region files !edit reads."""
+    return SERVER_DIR / server_properties().get("level-name", "world")
 
 
 def rcon_settings() -> tuple[str, int, str]:
