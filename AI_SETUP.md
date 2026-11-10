@@ -180,6 +180,8 @@ Tell the user:
 - Only ops can use it, and every `!design` uses their Claude plan.
 - Logs: `journalctl -u mcmcp -f` (service), or the terminal (by hand).
 - Settings are in `mcmcp/config.py`. Restart the builder after changing them.
+- Optional: an MCP client (Claude Code, Claude Desktop...) on this machine can also
+  build, see "MCP mode" in [README.md](README.md). Set it up only if the user asks.
 - To remove it: `sudo systemctl disable --now mcmcp`, delete
   `/etc/systemd/system/mcmcp.service` and `~/mcmcp`. RCON can be switched off again in
   `server.properties`.

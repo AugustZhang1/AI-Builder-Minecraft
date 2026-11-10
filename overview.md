@@ -89,6 +89,20 @@ merge the grid into /fill boxes  -->  RCON, rate-limited, with progress in chat
 - Rejected block ids and banned blocks (fluids, fire, TNT, falling blocks, portals,
   unbreakable blocks, spawners) are replaced with stone.
 
+## Changing a build
+
+- `!interior` furnishes the inside of the last design: the AI gets text maps of the
+  rooms and returns edits. The outer shell stays as it is.
+- `!edit` works on any build in the world, not only designs. `!pos1` and `!pos2` mark a
+  box (at most 100,000 blocks). The world is saved (`save-all flush`) and the box is
+  read straight from the world's region files, so no blocks are queried over RCON. The
+  AI returns its changes as boxes of blocks; they are shown as a hologram, with red
+  glass where blocks are removed, and `!place` applies them. Blocks with contents
+  (chests, signs...) are never changed. `!editundo` puts the original blocks back, one
+  level deep.
+- `!save` and `!load` keep designs in `work/saved/`, and `!export` writes the last
+  design as a Sponge schematic in `work/schematics/`.
+
 ## Build animation
 
 Vanilla commands only (`mcmcp/animate.py`), switched with `!designanim`:
@@ -125,6 +139,16 @@ colours that are clearly off and lists shape problems (missing hands, stumps, wr
 lengths) in chat. For a mesh, give the picture as a second link:
 `!statue <mesh link or name> <image link>`.
 
+## MCP mode
+
+`python -m mcmcp.main --mcp` runs the same pipeline as an MCP server over stdio
+(`mcmcp/mcp_server.py`), started by an MCP client such as Claude Code. Its tools
+`design`, `fix`, `move`, `place`, `pixelart` and `stop` call the same functions as the
+chat commands. Each takes the name of an online player, runs one step at a time under a
+build lock, and returns the chat lines the player saw. It does not read the server log
+and has no ops check. It is a separate process from the chat service, so the two don't
+share the build lock or the last designs.
+
 ## Code layout
 
 | File | What |
@@ -136,6 +160,12 @@ lengths) in chat. For a mesh, give the picture as a second link:
 | `mcmcp/ghost.py` | The hologram preview |
 | `mcmcp/animate.py` | Builder crew, scaffolding and markers |
 | `mcmcp/preview.py` | Preview images of a build, for the AI's review |
+| `mcmcp/interior.py` | `!interior`: finds the inside of a design and applies the AI's edits |
+| `mcmcp/region.py` | Reads a box of blocks from the world's region files, for `!edit` |
+| `mcmcp/edit_prompt.py`, `edit_ops.py`, `edit_undo.py` | `!edit`: the AI prompt, applying its changes, and the undo |
+| `mcmcp/saves.py` | `!save`, `!load`, `!saves` |
+| `mcmcp/schem.py` | `!export`: Sponge schematic writer |
+| `mcmcp/mcp_server.py` | MCP mode (`--mcp`) |
 | `mcmcp/pixelart.py` | `!pixelart` |
 | `mcmcp/statue.py` | `!statue`: image-to-3D models and saved meshes |
 | `mcmcp/statue_grid.py` | Mesh to blocks for statues, and their preview images |

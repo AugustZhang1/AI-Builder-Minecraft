@@ -54,6 +54,10 @@ chat line in logs/latest.log  (ops only)
 | `!editundo` | Takes back your last placed `!edit` |
 | `!move` | Moves the preview to where you stand, facing where you look |
 | `!place` | Builds the preview where it is (or your last design where you stand) |
+| `!save <name>` | Saves your last design for later (kept across restarts) |
+| `!load <name>` | Loads a saved design and shows its preview |
+| `!saves` | Lists your saved designs |
+| `!export` | Saves your last design as a schematic file (`.schem`) in `work/schematics/` |
 | `!pixelart <image link> [width]` | Builds the picture as a flat wall (no AI) |
 | `!statue <image or .glb link> [model] [height]` | Builds a 3D statue from a picture (image-to-3D model) or a mesh; height 40-256 blocks, default 180 |
 | `!statue <mesh link or name> <image link> [height]` | Builds a mesh and checks it against its picture (with `!statuecheck on`) |
@@ -211,13 +215,28 @@ client (Claude Code, Claude Desktop, ...) can build in your world. It has the to
 `design`, `fix`, `move`, `place`, `pixelart` and `stop`; each takes the name of an
 online player, builds in front of them, and returns the chat lines they saw.
 
+Do the install steps above first (RCON, the code, OpenSCAD and the AI CLI); the MCP
+client must run on the same machine as the Minecraft server. Then add it to your client,
+for Claude Code:
+
 ```
-claude mcp add mcmcp -e PYTHONPATH=/path/to/mcmcp -- /path/to/mcmcp/venv/bin/python -m mcmcp.main --mcp
+claude mcp add mcmcp -e PYTHONPATH=/path/to/mcmcp -e MCMCP_SERVER_DIR=/path/to/your/minecraft/server -- /path/to/mcmcp/venv/bin/python -m mcmcp.main --mcp
 ```
 
-It reads the same `.env` as the chat service. It is a separate
-process with its own build lock and last designs, so don't run builds from chat and
-from MCP at the same time. The AI is the one chosen with `!designai`.
+For other clients, use the same command, arguments and environment in their MCP
+settings. On Windows the Python path is `venv\Scripts\python.exe`. The client starts
+the server itself (over stdio), so there is nothing to keep running. The variables can
+also go in the `.env` file in the project folder instead of `-e`.
+
+Then ask the client, for example: "design a small stone watchtower for player Steve",
+and "place it" once you like the preview.
+
+- The tools do the same as the chat commands `!design`, `!designfix`, `!move`, `!place`,
+  `!pixelart` and `!designstop`. The other commands are chat only.
+- There is no ops check in MCP mode: whoever can use the MCP client can build.
+- It is a separate process from the chat service, with its own build lock and last
+  designs, so don't run builds from chat and from MCP at the same time.
+- The AI is the one chosen with `!designai`.
 
 ## Settings
 
